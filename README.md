@@ -1,5 +1,5 @@
 <center>
-    <img src='https://user-images.githubusercontent.com/59261158/132297943-58cffe78-2bc9-421b-a41d-55933ed57077.png' width=200>
+    <img src='https://user-images.githubusercontent.com/59261158/132297943-58cffe78-2bc9-421b-a41d-55933ed57077.png' width=200 align="center">
     <p>Projeto escolar produzido com Laravel 8 JetStream, TailwindCSS, VueJS e Inertia</p><br>
 </center>
 
