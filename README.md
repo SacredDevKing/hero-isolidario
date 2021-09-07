@@ -1,4 +1,4 @@
-![logo](https://user-images.githubusercontent.com/59261158/132297812-3f0e3867-54be-4e04-8641-4d50de619fc2.png)
+<img src='https://user-images.githubusercontent.com/59261158/132297812-3f0e3867-54be-4e04-8641-4d50de619fc2.png)' width=200>
 
 <p>Projeto escolar produzido com Laravel 8 JetStream, TailwindCSS, VueJS e Inertia</p><br>
 
