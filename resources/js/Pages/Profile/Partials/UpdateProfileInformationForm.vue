@@ -1,11 +1,11 @@
 <template>
     <jet-form-section @submitted="updateProfileInformation">
         <template #title>
-            Profile Information
+            Informações de perfil
         </template>
 
         <template #description>
-            Update your account's profile information and email address.
+            Atualizar a informação do seu perfil e endereço de e-mail.
         </template>
 
         <template #form>
@@ -16,7 +16,7 @@
                             ref="photo"
                             @change="updatePhotoPreview">
 
-                <jet-label for="photo" value="Photo" />
+                <jet-label for="photo" value="Foto" />
 
                 <!-- Current Profile Photo -->
                 <div class="mt-2" v-show="! photoPreview">
@@ -31,38 +31,187 @@
                 </div>
 
                 <jet-secondary-button class="mt-2 mr-2" type="button" @click.prevent="selectNewPhoto">
-                    Select A New Photo
+                    Selecione uma nova foto
                 </jet-secondary-button>
 
                 <jet-secondary-button type="button" class="mt-2" @click.prevent="deletePhoto" v-if="user.profile_photo_path">
-                    Remove Photo
+                    Remover foto
                 </jet-secondary-button>
 
                 <jet-input-error :message="form.errors.photo" class="mt-2" />
             </div>
 
-            <!-- Name -->
+            <!-- Nome -->
             <div class="col-span-6 sm:col-span-4">
-                <jet-label for="name" value="Name" />
-                <jet-input id="name" type="text" class="mt-1 block w-full" v-model="form.name" autocomplete="name" />
+                <jet-label for="nome" value="Nome" />
+                <jet-input id="nome" type="text" class="mt-1 block w-full" v-model="form.nome" autocomplete="first_name" />
+                <jet-input-error :message="form.errors.name" class="mt-2" />
+            </div>
+
+            <!-- Sobrenome -->
+            <div class="col-span-6 sm:col-span-4">
+                <jet-label for="sobrenome" value="Sobrenome" />
+                <jet-input id="sobrenome" type="text" class="mt-1 block w-full" v-model="form.sobrenome" autocomplete="last_name" />
+                <jet-input-error :message="form.errors.name" class="mt-2" />
+            </div>
+
+            <!-- Apelido -->
+            <div class="col-span-6 sm:col-span-4">
+                <jet-label for="apelido" value="Apelido" />
+                <jet-input id="apelido" type="text" class="mt-1 block w-full" v-model="form.apelido"/>
                 <jet-input-error :message="form.errors.name" class="mt-2" />
             </div>
 
             <!-- Email -->
             <div class="col-span-6 sm:col-span-4">
                 <jet-label for="email" value="Email" />
-                <jet-input id="email" type="email" class="mt-1 block w-full" v-model="form.email" />
+                <jet-input id="email" type="email" class="mt-1 block w-full" v-model="form.email"/>
                 <jet-input-error :message="form.errors.email" class="mt-2" />
             </div>
+                
+            <!-- Genero -->
+            <div class="col-span-6 sm:col-span-4">
+                <jet-label for="genero" value="Gênero" />
+                <select id="genero" class="mt-1 block w-full border-gray-300 focus:border-red-300 focus:ring focus:ring-red-200 focus:ring-opacity-50 rounded-md shadow-sm" v-model="form.genero" required>
+                        <option value="masculino">
+                            Masculino
+                        </option>
+                        <option value="feminino">
+                            Feminino
+                        </option>
+                </select>
+            </div>
+            
+            <!--Data de Nascimento/Celular-->
+            <div class="col-span-6 sm:col-span-4">
+                <jet-label for="data_nascimento" value="Data de nascimento" />
+                <jet-input id="data_nascimento" type="date" class="mt-1 block w-full" v-model="form.data_nascimento" :max="max" required autocomplete="data_nascimento"></jet-input>
+            </div>
+            <div class="col-span-6 sm:col-span-4">
+                <jet-label for="celular" value="Celular" />
+                <jet-input id="celular" type="text" class="mt-1 block w-full" v-model="form.celular" @keyup="celMask" :maxlength='11' placeholder="(00) 00000-0000" required autocomplete="celular"></jet-input>
+            </div>
+
+            <!--Rua/Bairro-->
+            
+                <div class="col-span-6 sm:col-span-4">
+                    <jet-label for="rua" value="Rua"/>
+                    <jet-input id="rua" type="text" class="mt-1 block w-full" v-model="form.rua" required autofocus autocomplete="rua"/>
+                </div>
+                <div class="col-span-6 sm:col-span-4">
+                    <jet-label for="bairro" value="Bairro"/>
+                    <jet-input id="bairro" type="text" class="mt-1 block w-full" v-model="form.bairro" required autofocus autocomplete="bairro"/>
+                </div>
+            
+
+            <!--Numero/Cidade-->
+            
+                <div class="col-span-6 sm:col-span-4">
+                    <jet-label for="numero" value="Número"/>
+                    <jet-input id="numero" type="text" class="mt-1 block w-full" v-model="form.numero" required autofocus autocomplete="numero"/>
+                </div>
+                <div class="col-span-6 sm:col-span-4">
+                    <jet-label for="cidade" value="Cidade"/>
+                    <jet-input id="cidade" type="text" class="mt-1 block w-full" v-model="form.cidade" required autofocus autocomplete="cidade"/>
+                </div>
+            
+
+            
+                <div class="col-span-6 sm:col-span-4">
+                    <jet-label for="uf" value="UF" />
+                    <select id="uf" class="mt-1 block w-full border-gray-300 focus:border-red-300 focus:ring focus:ring-red-200 focus:ring-opacity-50 rounded-md shadow-sm" v-model="form.uf" required>
+                            <option value="ac">
+                                AC (Acre)
+                            </option>
+                            <option value="al">
+                                AL (Alagoas)
+                            </option>
+                            <option value="ap">
+                                AP (Amapá)
+                            </option>
+                            <option value="am">
+                                AM (Amazonas)
+                            </option>
+                            <option value="ba">
+                                BA (Bahia)
+                            </option>
+                            <option value="ce">
+                                CE (Ceará)
+                            </option>
+                            <option value="df">
+                                DF (Distrito Federal)
+                            </option>
+                            <option value="es">
+                                ES (Espírito Santo)
+                            </option>
+                            <option value="go">
+                                GO (Goiás)
+                            </option>
+                            <option value="ma">
+                                MA (Maranhão)
+                            </option>
+                            <option value="mt">
+                                MT (Mato Grosso)
+                            </option>
+                            <option value="ms">
+                                MS (Mato Grosso do Sul)
+                            </option>
+                            <option value="pa">
+                                PA (Pará)
+                            </option>
+                            <option value="pr">
+                                PR (Paraíba)
+                            </option>
+                            <option value="pe">
+                                PE (Pernambuco)
+                            </option>
+                            <option value="pi">
+                                PI (Piauí)
+                            </option>
+                            <option value="rj">
+                                RJ (Rio de Janeiro)
+                            </option>
+                            <option value="rn">
+                                RN (Rio Grande do Norte)
+                            </option>
+                            <option value="rs">
+                                RS (Rio Grande do Sul)
+                            </option>
+                            <option value="ro">
+                                RO (Rondônia)
+                            </option>
+                            <option value="rr">
+                                RR (Roraima)
+                            </option>
+                            <option value="sc">
+                                SC (Santa Catarina)
+                            </option>
+                            <option value="sp">
+                                SP (São Paulo)
+                            </option>
+                            <option value="mg">
+                                SE (Sergipe)
+                            </option>
+                            <option value="to">
+                                TO (Tocantins)
+                            </option>
+                    </select>
+                </div>
+                <div class="col-span-6 sm:col-span-4">
+                    <jet-label for="cep" value="CEP"/>
+                    <jet-input id="cep" type="text" class="mt-1 block w-full" v-model="form.cep" @keyup="cepMask" :maxlength='8' placeholder="00.000-000" required autofocus autocomplete="cep"/>
+                </div>
+            
+            
         </template>
 
         <template #actions>
             <jet-action-message :on="form.recentlySuccessful" class="mr-3">
-                Saved.
+                Salvo.
             </jet-action-message>
 
             <jet-button :class="{ 'opacity-25': form.processing }" :disabled="form.processing">
-                Save
+                Salvar
             </jet-button>
         </template>
     </jet-form-section>
@@ -94,9 +243,36 @@
             return {
                 form: this.$inertia.form({
                     _method: 'PUT',
-                    name: this.user.nome,
+                    nome: this.user.nome,
+                    sobrenome: this.user.sobrenome,
+                    apelido: this.user.apelido,
                     email: this.user.email,
+                    genero: this.user.genero,
+                    data_nascimento: this.user.data_nascimento,
+                    celular: this.user.celular,
+                    cidade: this.user.cidade,
+                    rua: this.user.rua,
+                    bairro: this.user.bairro,
+                    numero: this.user.numero,
+                    uf: this.user.uf,
+                    cpf: this.user.cpf,
                     photo: null,
+
+                    /*nome: '',
+                    sobrenome: '',
+                    email: '',
+                    password: '',
+                    password_confirmation: '',
+                    apelido: '',
+                    genero:'',
+                    data_nascimento: '',
+                    celular: '',
+                    cidade: '',
+                    rua: '',
+                    bairro: '',
+                    numero: '',
+                    uf: '',
+                    cep: '',*/
                 }),
 
                 photoPreview: null,

@@ -20,6 +20,17 @@ class UpdateUserProfileInformation implements UpdatesUserProfileInformation
     {
         Validator::make($input, [
             'nome' => ['required', 'string', 'max:255'],
+            'sobrenome' => ['required', 'string', 'max:255'],
+            'apelido' => ['required', 'string', 'max:255'],
+            'genero' => ['required', 'string', 'max:255'],
+            'celular' => ['required', 'string', 'max:255'],
+            'data_nascimento' => ['required', 'string', 'date', 'max:255'],
+            'cidade' => ['required', 'string', 'max:255'],
+            'rua' => ['required', 'string', 'max:255'],
+            'bairro' => ['required', 'string', 'max:255'],
+            'numero' => ['required', 'string', 'max:255'],
+            'uf' => ['required', 'string', 'max:255'],
+            'cep' => ['required', 'string', 'max:255'],
             'email' => ['required', 'email', 'max:255', Rule::unique('users')->ignore($user->id)],
             'photo' => ['nullable', 'mimes:jpg,jpeg,png', 'max:1024'],
         ])->validateWithBag('updateProfileInformation');
@@ -34,7 +45,18 @@ class UpdateUserProfileInformation implements UpdatesUserProfileInformation
         } else {
             $user->forceFill([
                 'nome' => $input['nome'],
+                'sobrenome' => $input['sobrenome'],
                 'email' => $input['email'],
+                'apelido' => $input['apelido'],
+                'genero' => $input['genero'],
+                'celular' => $input['celular'],
+                'data_nascimento' => $input['data_nascimento'],
+                'cidade' => $input['cidade'],
+                'rua' => $input['rua'],
+                'bairro' => $input['bairro'],
+                'numero' => $input['numero'],
+                'uf' => $input['uf'],
+                'cep' => $input['cep'],
             ])->save();
         }
     }

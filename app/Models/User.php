@@ -37,7 +37,8 @@ class User extends Authenticatable
         'bairro',
         'numero',
         'uf',
-        'cep'
+        'cep',
+        'qntd_pedidos'
     ];
 
     /**

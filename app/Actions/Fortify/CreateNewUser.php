@@ -53,6 +53,7 @@ class CreateNewUser implements CreatesNewUsers
             'numero' => $input['numero'],
             'uf' => $input['uf'],
             'cep' => $input['cep'],
+            'qntd_pedidos' => '2'
         ]);
     }
 }

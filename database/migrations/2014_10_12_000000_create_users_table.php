@@ -30,6 +30,7 @@ class CreateUsersTable extends Migration
             $table->integer('numero');
             $table->string('uf');
             $table->string('cep');
+            $table->integer('qntd_pedidos');
             $table->rememberToken();
             $table->string('profile_photo_path', 2048)->nullable();
             $table->timestamps();
