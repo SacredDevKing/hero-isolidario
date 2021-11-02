@@ -5,22 +5,23 @@
         <jet-banner />
 
         <div class="min-h-screen bg-gray-100 shadow">
-            <nav class="bg-white border-b border-gray-100 shadow">
+            <nav class="bg-purple-500 border-b border-gray-100 shadow">
                 <!-- Primary Navigation Menu -->
                 <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
                     <div class="flex justify-between h-20">
                         <div class="flex">
                             <!-- Logo -->
                             <div class="flex-shrink-0 flex items-center">
-                                <Link :href="route('dashboard')">
+                                <Link :href="route('home')">
                                     <jet-application-mark class="block h-9 w-auto" />
                                 </Link>
                             </div>
 
                             <!-- Navigation Links -->
-                            <div class="hidden space-x-8 sm:-my-px sm:ml-10 sm:flex">
-                                <jet-nav-link :href="route('dashboard')" :active="route().current('dashboard')">
-                                    Dashboard
+                            <div class="hidden space-x-8 sm:-my-px sm:ml-10 sm:flex ">
+                                <jet-nav-link :href="route('home')" :active="route().current('home')">
+                                    <svg xmlns="http://www.w3.org/2000/svg" x="0px" y="0px" width="32" height="32" viewBox="0 0 172 172" class=" mr-2"><path d="M86,16.125c-38.52783,0 -69.875,31.34717 -69.875,69.875c0,38.52783 31.34717,69.875 69.875,69.875c38.52783,0 69.875,-31.34717 69.875,-69.875c0,-38.52783 -31.34717,-69.875 -69.875,-69.875zM86,26.875c32.71192,0 59.125,26.41309 59.125,59.125c0,32.71192 -26.41308,59.125 -59.125,59.125c-32.71191,0 -59.125,-26.41308 -59.125,-59.125c0,-32.71191 26.41309,-59.125 59.125,-59.125zM80.625,53.75v10.75h10.75v-10.75zM80.625,75.25v43h10.75v-43z"></path></svg>
+                                    Sobre Nós 
                                 </jet-nav-link>
                             </div>
                         </div>
@@ -86,7 +87,7 @@
                                 <jet-dropdown align="right" width="48">
                                     <template #trigger>
                                         <button v-if="$page.props.jetstream.managesProfilePhotos" class="flex text-sm border-2 border-transparent rounded-full focus:outline-none focus:border-gray-300 transition">
-                                            <img class="h-8 w-8 rounded-full object-cover" :src="$page.props.user.profile_photo_url" :alt="$page.props.user.name" />
+                                            <img class="h-10 w-10 rounded-full object-cover" :src="$page.props.user.profile_photo_url" :alt="$page.props.user.name" />
                                         </button>
 
                                         <span v-else class="inline-flex rounded-md">
@@ -142,8 +143,8 @@
                 <!-- Responsive Navigation Menu -->
                 <div :class="{'block': showingNavigationDropdown, 'hidden': ! showingNavigationDropdown}" class="sm:hidden">
                     <div class="pt-2 pb-3 space-y-1">
-                        <jet-responsive-nav-link :href="route('dashboard')" :active="route().current('dashboard')">
-                            Dashboard
+                        <jet-responsive-nav-link :href="route('home')" :active="route().current('home')">
+                            Home
                         </jet-responsive-nav-link>
                     </div>
 
@@ -231,6 +232,12 @@
         </div>
     </div>
 </template>
+
+<style scoped>
+    .bg-purple-500 {
+        background-color: #3D3D52;
+    }
+</style>
 
 <script>
     import JetApplicationMark from '@/Jetstream/ApplicationMark.vue'

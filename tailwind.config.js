@@ -20,6 +20,7 @@ module.exports = {
                 'hero-bg': "url('/img/hero_bg.jpg')",
             })
         },
+
     },
 
     variants: {

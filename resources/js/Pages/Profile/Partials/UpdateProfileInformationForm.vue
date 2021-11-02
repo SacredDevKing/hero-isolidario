@@ -96,11 +96,11 @@
             
                 <div class="col-span-6 sm:col-span-4">
                     <jet-label for="rua" value="Rua"/>
-                    <jet-input id="rua" type="text" class="mt-1 block w-full" v-model="form.rua" required autofocus autocomplete="rua"/>
+                    <jet-input id="rua" type="text" class="mt-1 block w-full" v-model="form.rua" required autocomplete="rua"/>
                 </div>
                 <div class="col-span-6 sm:col-span-4">
                     <jet-label for="bairro" value="Bairro"/>
-                    <jet-input id="bairro" type="text" class="mt-1 block w-full" v-model="form.bairro" required autofocus autocomplete="bairro"/>
+                    <jet-input id="bairro" type="text" class="mt-1 block w-full" v-model="form.bairro" required autocomplete="bairro"/>
                 </div>
             
 
@@ -108,11 +108,11 @@
             
                 <div class="col-span-6 sm:col-span-4">
                     <jet-label for="numero" value="Número"/>
-                    <jet-input id="numero" type="text" class="mt-1 block w-full" v-model="form.numero" required autofocus autocomplete="numero"/>
+                    <jet-input id="numero" type="text" class="mt-1 block w-full" v-model="form.numero" required autocomplete="numero"/>
                 </div>
                 <div class="col-span-6 sm:col-span-4">
                     <jet-label for="cidade" value="Cidade"/>
-                    <jet-input id="cidade" type="text" class="mt-1 block w-full" v-model="form.cidade" required autofocus autocomplete="cidade"/>
+                    <jet-input id="cidade" type="text" class="mt-1 block w-full" v-model="form.cidade" required autocomplete="cidade"/>
                 </div>
             
 
@@ -199,7 +199,7 @@
                 </div>
                 <div class="col-span-6 sm:col-span-4">
                     <jet-label for="cep" value="CEP"/>
-                    <jet-input id="cep" type="text" class="mt-1 block w-full" v-model="form.cep" @keyup="cepMask" :maxlength='8' placeholder="00.000-000" required autofocus autocomplete="cep"/>
+                    <jet-input id="cep" type="text" class="mt-1 block w-full" v-model="form.cep" @keyup="cepMask" :maxlength='8' placeholder="00.000-000" required autocomplete="cep"/>
                 </div>
             
             
@@ -255,24 +255,8 @@
                     bairro: this.user.bairro,
                     numero: this.user.numero,
                     uf: this.user.uf,
-                    cpf: this.user.cpf,
-                    photo: null,
-
-                    /*nome: '',
-                    sobrenome: '',
-                    email: '',
-                    password: '',
-                    password_confirmation: '',
-                    apelido: '',
-                    genero:'',
-                    data_nascimento: '',
-                    celular: '',
-                    cidade: '',
-                    rua: '',
-                    bairro: '',
-                    numero: '',
-                    uf: '',
-                    cep: '',*/
+                    cep: this.user.cep,
+                    photo: null
                 }),
 
                 photoPreview: null,
@@ -325,6 +309,19 @@
                     this.$refs.photo.value = null;
                 }
             },
+
+            cepMask(){
+                this.form.cep = this.form.cep.replace(/[^0-9]/g, '').replace(/^(\d{2})(\d{3})(\d{3})/g, '$1.$2-$3');
+            },
+
+            celMask(){
+                this.form.celular = this.form.celular.replace(/[^0-9]/g, '').replace(/^(\d{2})(\d{5})(\d{4})/g, '($1) $2-$3')
+            },
+
+            resetMask(){
+                this.form.cep = this.form.cep.replace(/[^0-9]/g, '');
+                this.form.celular = this.form.celular.replace(/[^0-9]/g, '');
+            }
         },
     }
 </script>

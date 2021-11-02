@@ -1,5 +1,5 @@
 <template>
-    <Head title="Two-factor Confirmation" />
+    <Head title="Confirmação de Dois Fatores" />
 
     <jet-authentication-card>
         <template #logo>
@@ -8,11 +8,11 @@
 
         <div class="mb-4 text-sm text-gray-600">
             <template v-if="! recovery">
-                Please confirm access to your account by entering the authentication code provided by your authenticator application.
+                Por favor, confirme o acesso a sua conta inserindo o código de autenticação que apareceu no seu aplicativo.
             </template>
 
             <template v-else>
-                Please confirm access to your account by entering one of your emergency recovery codes.
+                Por favor, confirme o acesso a sua conta inserindo um dos seus códigos de recuperação de emergência.
             </template>
         </div>
 
@@ -20,23 +20,23 @@
 
         <form @submit.prevent="submit">
             <div v-if="! recovery">
-                <jet-label for="code" value="Code" />
+                <jet-label for="code" value="Código" />
                 <jet-input ref="code" id="code" type="text" inputmode="numeric" class="mt-1 block w-full" v-model="form.code" autofocus autocomplete="one-time-code" />
             </div>
 
             <div v-else>
-                <jet-label for="recovery_code" value="Recovery Code" />
+                <jet-label for="recovery_code" value="Código de recuperação" />
                 <jet-input ref="recovery_code" id="recovery_code" type="text" class="mt-1 block w-full" v-model="form.recovery_code" autocomplete="one-time-code" />
             </div>
 
             <div class="flex items-center justify-end mt-4">
                 <button type="button" class="text-sm text-gray-600 hover:text-gray-900 underline cursor-pointer" @click.prevent="toggleRecovery">
                     <template v-if="! recovery">
-                        Use a recovery code
+                        Usar um código de recuperação
                     </template>
 
                     <template v-else>
-                        Use an authentication code
+                        Usar um código de autenticação
                     </template>
                 </button>
 

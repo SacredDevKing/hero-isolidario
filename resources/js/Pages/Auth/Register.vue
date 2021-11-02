@@ -113,6 +113,7 @@
                 </div>
             </div>
 
+
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4">
                 <div class="mt-4">
                     <jet-label for="uf" value="UF" />
@@ -291,7 +292,7 @@
 
             resetMask(){
                 this.form.cep = this.form.cep.replace(/[^0-9]/g, '');
-                this.form.celular = this.form.cep.replace(/[^0-9]/g, '');
+                this.form.celular = this.form.celular.replace(/[^0-9]/g, '');
             }
         },
     }

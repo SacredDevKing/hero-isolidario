@@ -62,6 +62,9 @@ class User extends Authenticatable
         'email_verified_at' => 'datetime',
     ];
 
+
+    
+
     /**
      * The accessors to append to the model's array form.
      *
@@ -70,4 +73,21 @@ class User extends Authenticatable
     protected $appends = [
         'profile_photo_url',
     ];
+
+    /**
+     * Get the default profile photo URL if no profile photo has been uploaded.
+     *
+     * @return string
+     */
+    protected function defaultProfilePhotoUrl()
+    {
+        return asset('img/profilepic.jpg');
+    }
+
+        /**
+     * The attributes that should be cast to native types.
+     *
+     * @var array
+     */
+    //protected $with = ['profile'];
 }
