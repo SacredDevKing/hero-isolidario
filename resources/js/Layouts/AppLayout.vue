@@ -19,9 +19,19 @@
 
                             <!-- Navigation Links -->
                             <div class="hidden space-x-8 sm:-my-px sm:ml-10 sm:flex ">
-                                <jet-nav-link :href="route('home')" :active="route().current('home')">
-                                    <svg xmlns="http://www.w3.org/2000/svg" x="0px" y="0px" width="32" height="32" viewBox="0 0 172 172" class=" mr-2"><path d="M86,16.125c-38.52783,0 -69.875,31.34717 -69.875,69.875c0,38.52783 31.34717,69.875 69.875,69.875c38.52783,0 69.875,-31.34717 69.875,-69.875c0,-38.52783 -31.34717,-69.875 -69.875,-69.875zM86,26.875c32.71192,0 59.125,26.41309 59.125,59.125c0,32.71192 -26.41308,59.125 -59.125,59.125c-32.71191,0 -59.125,-26.41308 -59.125,-59.125c0,-32.71191 26.41309,-59.125 59.125,-59.125zM80.625,53.75v10.75h10.75v-10.75zM80.625,75.25v43h10.75v-43z"></path></svg>
-                                    Sobre Nós 
+                                <jet-nav-link :href="route('doacoes')" :active="route().current('doacoes')">
+                                    <Icon icon="icon-park-outline:ad-product" style="font-size:32px" class="mr-2"/>
+                                    Doações
+                                </jet-nav-link>
+
+                                <jet-nav-link :href="route('projetos-caridade')" :active="route().current('projetos-caridade')">
+                                    <Icon icon="iconoir:donate" style="font-size:32px" class="mr-2"/>
+                                    Projetos
+                                </jet-nav-link>
+
+                                <jet-nav-link :href="route('sobre-nos')" :active="route().current('sobre-nos')">
+                                    <Icon icon="ant-design:info-circle-outlined" style="font-size:32px" class="mr-2"/>
+                                    Sobre
                                 </jet-nav-link>
                             </div>
                         </div>
@@ -104,11 +114,16 @@
                                     <template #content>
                                         <!-- Account Management -->
                                         <div class="block px-4 py-2 text-xs text-gray-400">
-                                            Manage Account
+                                            <Icon icon="healthicons:ui-user-profile-outline" style="font-size:32px" class=""/>
+                                            Conta
                                         </div>
 
                                         <jet-dropdown-link :href="route('profile.show')">
-                                            Profile
+                                            Perfil
+                                        </jet-dropdown-link>
+
+                                        <jet-dropdown-link :href="route('minhas-doacoes')">
+                                            Minhas Doações
                                         </jet-dropdown-link>
 
                                         <jet-dropdown-link :href="route('api-tokens.index')" v-if="$page.props.jetstream.hasApiFeatures">
@@ -126,6 +141,8 @@
                                     </template>
                                 </jet-dropdown>
                             </div>
+
+                            <jet-button class="ml-4 rounded-full" :href="route('quero-doar')">Quero Doar</jet-button>
                         </div>
 
                         <!-- Hamburger -->
@@ -246,7 +263,10 @@
     import JetDropdownLink from '@/Jetstream/DropdownLink.vue'
     import JetNavLink from '@/Jetstream/NavLink.vue'
     import JetResponsiveNavLink from '@/Jetstream/ResponsiveNavLink.vue'
+    import JetButton from '@/Jetstream/Button.vue'
+    import JetInput from '@/Jetstream/Input.vue'
     import { Head, Link } from '@inertiajs/inertia-vue3';
+    import { Icon } from '@iconify/vue';
 
     export default {
         props: {
@@ -261,6 +281,9 @@
             JetDropdownLink,
             JetNavLink,
             JetResponsiveNavLink,
+            JetButton,
+            JetInput,
+            Icon,
             Link,
         },
 

@@ -17218,6 +17218,7 @@ module.exports = function xhrAdapter(config) {
   return new Promise(function dispatchXhrRequest(resolve, reject) {
     var requestData = config.data;
     var requestHeaders = config.headers;
+    var responseType = config.responseType;
 
     if (utils.isFormData(requestData)) {
       delete requestHeaders['Content-Type']; // Let the browser set it
@@ -17238,23 +17239,14 @@ module.exports = function xhrAdapter(config) {
     // Set the request timeout in MS
     request.timeout = config.timeout;
 
-    // Listen for ready state
-    request.onreadystatechange = function handleLoad() {
-      if (!request || request.readyState !== 4) {
+    function onloadend() {
+      if (!request) {
         return;
       }
-
-      // The request errored out and we didn't get a response, this will be
-      // handled by onerror instead
-      // With one exception: request that using file: protocol, most browsers
-      // will return status as 0 even though it's a successful request
-      if (request.status === 0 && !(request.responseURL && request.responseURL.indexOf('file:') === 0)) {
-        return;
-      }
-
       // Prepare the response
       var responseHeaders = 'getAllResponseHeaders' in request ? parseHeaders(request.getAllResponseHeaders()) : null;
-      var responseData = !config.responseType || config.responseType === 'text' ? request.responseText : request.response;
+      var responseData = !responseType || responseType === 'text' ||  responseType === 'json' ?
+        request.responseText : request.response;
       var response = {
         data: responseData,
         status: request.status,
@@ -17268,7 +17260,30 @@ module.exports = function xhrAdapter(config) {
 
       // Clean up request
       request = null;
-    };
+    }
+
+    if ('onloadend' in request) {
+      // Use onloadend if available
+      request.onloadend = onloadend;
+    } else {
+      // Listen for ready state to emulate onloadend
+      request.onreadystatechange = function handleLoad() {
+        if (!request || request.readyState !== 4) {
+          return;
+        }
+
+        // The request errored out and we didn't get a response, this will be
+        // handled by onerror instead
+        // With one exception: request that using file: protocol, most browsers
+        // will return status as 0 even though it's a successful request
+        if (request.status === 0 && !(request.responseURL && request.responseURL.indexOf('file:') === 0)) {
+          return;
+        }
+        // readystate handler is calling before onerror or ontimeout handlers,
+        // so we should call onloadend on the next 'tick'
+        setTimeout(onloadend);
+      };
+    }
 
     // Handle browser request cancellation (as opposed to a manual cancellation)
     request.onabort = function handleAbort() {
@@ -17298,7 +17313,10 @@ module.exports = function xhrAdapter(config) {
       if (config.timeoutErrorMessage) {
         timeoutErrorMessage = config.timeoutErrorMessage;
       }
-      reject(createError(timeoutErrorMessage, config, 'ECONNABORTED',
+      reject(createError(
+        timeoutErrorMessage,
+        config,
+        config.transitional && config.transitional.clarifyTimeoutError ? 'ETIMEDOUT' : 'ECONNABORTED',
         request));
 
       // Clean up request
@@ -17338,16 +17356,8 @@ module.exports = function xhrAdapter(config) {
     }
 
     // Add responseType to request if needed
-    if (config.responseType) {
-      try {
-        request.responseType = config.responseType;
-      } catch (e) {
-        // Expected DOMException thrown by browsers not compatible XMLHttpRequest Level 2.
-        // But, this can be suppressed for 'json' type as it can be parsed by default 'transformResponse' function.
-        if (config.responseType !== 'json') {
-          throw e;
-        }
-      }
+    if (responseType && responseType !== 'json') {
+      request.responseType = config.responseType;
     }
 
     // Handle progress if needed
@@ -17581,7 +17591,9 @@ var buildURL = __webpack_require__(/*! ../helpers/buildURL */ "./node_modules/ax
 var InterceptorManager = __webpack_require__(/*! ./InterceptorManager */ "./node_modules/axios/lib/core/InterceptorManager.js");
 var dispatchRequest = __webpack_require__(/*! ./dispatchRequest */ "./node_modules/axios/lib/core/dispatchRequest.js");
 var mergeConfig = __webpack_require__(/*! ./mergeConfig */ "./node_modules/axios/lib/core/mergeConfig.js");
+var validator = __webpack_require__(/*! ../helpers/validator */ "./node_modules/axios/lib/helpers/validator.js");
 
+var validators = validator.validators;
 /**
  * Create a new instance of Axios
  *
@@ -17621,20 +17633,71 @@ Axios.prototype.request = function request(config) {
     config.method = 'get';
   }
 
-  // Hook up interceptors middleware
-  var chain = [dispatchRequest, undefined];
-  var promise = Promise.resolve(config);
+  var transitional = config.transitional;
 
+  if (transitional !== undefined) {
+    validator.assertOptions(transitional, {
+      silentJSONParsing: validators.transitional(validators.boolean, '1.0.0'),
+      forcedJSONParsing: validators.transitional(validators.boolean, '1.0.0'),
+      clarifyTimeoutError: validators.transitional(validators.boolean, '1.0.0')
+    }, false);
+  }
+
+  // filter out skipped interceptors
+  var requestInterceptorChain = [];
+  var synchronousRequestInterceptors = true;
   this.interceptors.request.forEach(function unshiftRequestInterceptors(interceptor) {
-    chain.unshift(interceptor.fulfilled, interceptor.rejected);
+    if (typeof interceptor.runWhen === 'function' && interceptor.runWhen(config) === false) {
+      return;
+    }
+
+    synchronousRequestInterceptors = synchronousRequestInterceptors && interceptor.synchronous;
+
+    requestInterceptorChain.unshift(interceptor.fulfilled, interceptor.rejected);
   });
 
+  var responseInterceptorChain = [];
   this.interceptors.response.forEach(function pushResponseInterceptors(interceptor) {
-    chain.push(interceptor.fulfilled, interceptor.rejected);
+    responseInterceptorChain.push(interceptor.fulfilled, interceptor.rejected);
   });
 
-  while (chain.length) {
-    promise = promise.then(chain.shift(), chain.shift());
+  var promise;
+
+  if (!synchronousRequestInterceptors) {
+    var chain = [dispatchRequest, undefined];
+
+    Array.prototype.unshift.apply(chain, requestInterceptorChain);
+    chain = chain.concat(responseInterceptorChain);
+
+    promise = Promise.resolve(config);
+    while (chain.length) {
+      promise = promise.then(chain.shift(), chain.shift());
+    }
+
+    return promise;
+  }
+
+
+  var newConfig = config;
+  while (requestInterceptorChain.length) {
+    var onFulfilled = requestInterceptorChain.shift();
+    var onRejected = requestInterceptorChain.shift();
+    try {
+      newConfig = onFulfilled(newConfig);
+    } catch (error) {
+      onRejected(error);
+      break;
+    }
+  }
+
+  try {
+    promise = dispatchRequest(newConfig);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+
+  while (responseInterceptorChain.length) {
+    promise = promise.then(responseInterceptorChain.shift(), responseInterceptorChain.shift());
   }
 
   return promise;
@@ -17696,10 +17759,12 @@ function InterceptorManager() {
  *
  * @return {Number} An ID used to remove interceptor later
  */
-InterceptorManager.prototype.use = function use(fulfilled, rejected) {
+InterceptorManager.prototype.use = function use(fulfilled, rejected, options) {
   this.handlers.push({
     fulfilled: fulfilled,
-    rejected: rejected
+    rejected: rejected,
+    synchronous: options ? options.synchronous : false,
+    runWhen: options ? options.runWhen : null
   });
   return this.handlers.length - 1;
 };
@@ -17832,7 +17897,8 @@ module.exports = function dispatchRequest(config) {
   config.headers = config.headers || {};
 
   // Transform request data
-  config.data = transformData(
+  config.data = transformData.call(
+    config,
     config.data,
     config.headers,
     config.transformRequest
@@ -17858,7 +17924,8 @@ module.exports = function dispatchRequest(config) {
     throwIfCancellationRequested(config);
 
     // Transform response data
-    response.data = transformData(
+    response.data = transformData.call(
+      config,
       response.data,
       response.headers,
       config.transformResponse
@@ -17871,7 +17938,8 @@ module.exports = function dispatchRequest(config) {
 
       // Transform response data
       if (reason && reason.response) {
-        reason.response.data = transformData(
+        reason.response.data = transformData.call(
+          config,
           reason.response.data,
           reason.response.headers,
           config.transformResponse
@@ -18083,6 +18151,7 @@ module.exports = function settle(resolve, reject, response) {
 
 
 var utils = __webpack_require__(/*! ./../utils */ "./node_modules/axios/lib/utils.js");
+var defaults = __webpack_require__(/*! ./../defaults */ "./node_modules/axios/lib/defaults.js");
 
 /**
  * Transform the data for a request or a response
@@ -18093,9 +18162,10 @@ var utils = __webpack_require__(/*! ./../utils */ "./node_modules/axios/lib/util
  * @returns {*} The resulting transformed data
  */
 module.exports = function transformData(data, headers, fns) {
+  var context = this || defaults;
   /*eslint no-param-reassign:0*/
   utils.forEach(fns, function transform(fn) {
-    data = fn(data, headers);
+    data = fn.call(context, data, headers);
   });
 
   return data;
@@ -18116,6 +18186,7 @@ module.exports = function transformData(data, headers, fns) {
 
 var utils = __webpack_require__(/*! ./utils */ "./node_modules/axios/lib/utils.js");
 var normalizeHeaderName = __webpack_require__(/*! ./helpers/normalizeHeaderName */ "./node_modules/axios/lib/helpers/normalizeHeaderName.js");
+var enhanceError = __webpack_require__(/*! ./core/enhanceError */ "./node_modules/axios/lib/core/enhanceError.js");
 
 var DEFAULT_CONTENT_TYPE = {
   'Content-Type': 'application/x-www-form-urlencoded'
@@ -18139,12 +18210,35 @@ function getDefaultAdapter() {
   return adapter;
 }
 
+function stringifySafely(rawValue, parser, encoder) {
+  if (utils.isString(rawValue)) {
+    try {
+      (parser || JSON.parse)(rawValue);
+      return utils.trim(rawValue);
+    } catch (e) {
+      if (e.name !== 'SyntaxError') {
+        throw e;
+      }
+    }
+  }
+
+  return (encoder || JSON.stringify)(rawValue);
+}
+
 var defaults = {
+
+  transitional: {
+    silentJSONParsing: true,
+    forcedJSONParsing: true,
+    clarifyTimeoutError: false
+  },
+
   adapter: getDefaultAdapter(),
 
   transformRequest: [function transformRequest(data, headers) {
     normalizeHeaderName(headers, 'Accept');
     normalizeHeaderName(headers, 'Content-Type');
+
     if (utils.isFormData(data) ||
       utils.isArrayBuffer(data) ||
       utils.isBuffer(data) ||
@@ -18161,20 +18255,32 @@ var defaults = {
       setContentTypeIfUnset(headers, 'application/x-www-form-urlencoded;charset=utf-8');
       return data.toString();
     }
-    if (utils.isObject(data)) {
-      setContentTypeIfUnset(headers, 'application/json;charset=utf-8');
-      return JSON.stringify(data);
+    if (utils.isObject(data) || (headers && headers['Content-Type'] === 'application/json')) {
+      setContentTypeIfUnset(headers, 'application/json');
+      return stringifySafely(data);
     }
     return data;
   }],
 
   transformResponse: [function transformResponse(data) {
-    /*eslint no-param-reassign:0*/
-    if (typeof data === 'string') {
+    var transitional = this.transitional;
+    var silentJSONParsing = transitional && transitional.silentJSONParsing;
+    var forcedJSONParsing = transitional && transitional.forcedJSONParsing;
+    var strictJSONParsing = !silentJSONParsing && this.responseType === 'json';
+
+    if (strictJSONParsing || (forcedJSONParsing && utils.isString(data) && data.length)) {
       try {
-        data = JSON.parse(data);
-      } catch (e) { /* Ignore */ }
+        return JSON.parse(data);
+      } catch (e) {
+        if (strictJSONParsing) {
+          if (e.name === 'SyntaxError') {
+            throw enhanceError(e, this, 'E_JSON_PARSE');
+          }
+          throw e;
+        }
+      }
     }
+
     return data;
   }],
 
@@ -18657,6 +18763,122 @@ module.exports = function spread(callback) {
 
 /***/ }),
 
+/***/ "./node_modules/axios/lib/helpers/validator.js":
+/*!*****************************************************!*\
+  !*** ./node_modules/axios/lib/helpers/validator.js ***!
+  \*****************************************************/
+/***/ ((module, __unused_webpack_exports, __webpack_require__) => {
+
+"use strict";
+
+
+var pkg = __webpack_require__(/*! ./../../package.json */ "./node_modules/axios/package.json");
+
+var validators = {};
+
+// eslint-disable-next-line func-names
+['object', 'boolean', 'number', 'function', 'string', 'symbol'].forEach(function(type, i) {
+  validators[type] = function validator(thing) {
+    return typeof thing === type || 'a' + (i < 1 ? 'n ' : ' ') + type;
+  };
+});
+
+var deprecatedWarnings = {};
+var currentVerArr = pkg.version.split('.');
+
+/**
+ * Compare package versions
+ * @param {string} version
+ * @param {string?} thanVersion
+ * @returns {boolean}
+ */
+function isOlderVersion(version, thanVersion) {
+  var pkgVersionArr = thanVersion ? thanVersion.split('.') : currentVerArr;
+  var destVer = version.split('.');
+  for (var i = 0; i < 3; i++) {
+    if (pkgVersionArr[i] > destVer[i]) {
+      return true;
+    } else if (pkgVersionArr[i] < destVer[i]) {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
+ * Transitional option validator
+ * @param {function|boolean?} validator
+ * @param {string?} version
+ * @param {string} message
+ * @returns {function}
+ */
+validators.transitional = function transitional(validator, version, message) {
+  var isDeprecated = version && isOlderVersion(version);
+
+  function formatMessage(opt, desc) {
+    return '[Axios v' + pkg.version + '] Transitional option \'' + opt + '\'' + desc + (message ? '. ' + message : '');
+  }
+
+  // eslint-disable-next-line func-names
+  return function(value, opt, opts) {
+    if (validator === false) {
+      throw new Error(formatMessage(opt, ' has been removed in ' + version));
+    }
+
+    if (isDeprecated && !deprecatedWarnings[opt]) {
+      deprecatedWarnings[opt] = true;
+      // eslint-disable-next-line no-console
+      console.warn(
+        formatMessage(
+          opt,
+          ' has been deprecated since v' + version + ' and will be removed in the near future'
+        )
+      );
+    }
+
+    return validator ? validator(value, opt, opts) : true;
+  };
+};
+
+/**
+ * Assert object's properties type
+ * @param {object} options
+ * @param {object} schema
+ * @param {boolean?} allowUnknown
+ */
+
+function assertOptions(options, schema, allowUnknown) {
+  if (typeof options !== 'object') {
+    throw new TypeError('options must be an object');
+  }
+  var keys = Object.keys(options);
+  var i = keys.length;
+  while (i-- > 0) {
+    var opt = keys[i];
+    var validator = schema[opt];
+    if (validator) {
+      var value = options[opt];
+      var result = value === undefined || validator(value, opt, options);
+      if (result !== true) {
+        throw new TypeError('option ' + opt + ' must be ' + result);
+      }
+      continue;
+    }
+    if (allowUnknown !== true) {
+      throw Error('Unknown option ' + opt);
+    }
+  }
+}
+
+module.exports = {
+  isOlderVersion: isOlderVersion,
+  assertOptions: assertOptions,
+  validators: validators
+};
+
+
+/***/ }),
+
 /***/ "./node_modules/axios/lib/utils.js":
 /*!*****************************************!*\
   !*** ./node_modules/axios/lib/utils.js ***!
@@ -18667,8 +18889,6 @@ module.exports = function spread(callback) {
 
 
 var bind = __webpack_require__(/*! ./helpers/bind */ "./node_modules/axios/lib/helpers/bind.js");
-
-/*global toString:true*/
 
 // utils is a library of generic helper functions non-specific to axios
 
@@ -18853,7 +19073,7 @@ function isURLSearchParams(val) {
  * @returns {String} The String freed of excess whitespace
  */
 function trim(str) {
-  return str.replace(/^\s*/, '').replace(/\s*$/, '');
+  return str.trim ? str.trim() : str.replace(/^\s+|\s+$/g, '');
 }
 
 /**
@@ -19634,7 +19854,7 @@ __webpack_require__.r(__webpack_exports__);
   props: ['href', 'active'],
   computed: {
     classes: function classes() {
-      return this.active ? 'inline-flex fill-current items-center px-1 pt-1 border-b-2 border-red-400 text-sm font-medium font-semibold leading-5 text-red-500 focus:outline-none focus:border-red-500 transition' : 'inline-flex fill-current items-center px-1 pt-1 border-b-2 border-transparent text-sm font-medium font-semibold leading-5 text-gray-50 hover:text-gray-700 hover:border-gray-300 focus:outline-none focus:text-gray-700 focus:border-gray-300 transition';
+      return this.active ? 'inline-flex fill-current items-center px-1 pt-1 border-b-2 border-red-400 text-sm font-medium font-semibold leading-5 text-red-500 focus:outline-none focus:border-red-500 transition' : 'inline-flex fill-current items-center px-1 pt-1 border-b-2 border-transparent text-sm font-medium font-semibold leading-5 text-gray-50 hover:text-red-500 hover:border-red-300 focus:outline-none focus:text-red-700 focus:border-red-300 transition';
     }
   }
 });
@@ -19752,7 +19972,13 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var _Jetstream_DropdownLink_vue__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! @/Jetstream/DropdownLink.vue */ "./resources/js/Jetstream/DropdownLink.vue");
 /* harmony import */ var _Jetstream_NavLink_vue__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! @/Jetstream/NavLink.vue */ "./resources/js/Jetstream/NavLink.vue");
 /* harmony import */ var _Jetstream_ResponsiveNavLink_vue__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(/*! @/Jetstream/ResponsiveNavLink.vue */ "./resources/js/Jetstream/ResponsiveNavLink.vue");
-/* harmony import */ var _inertiajs_inertia_vue3__WEBPACK_IMPORTED_MODULE_6__ = __webpack_require__(/*! @inertiajs/inertia-vue3 */ "./node_modules/@inertiajs/inertia-vue3/dist/index.js");
+/* harmony import */ var _Jetstream_Button_vue__WEBPACK_IMPORTED_MODULE_6__ = __webpack_require__(/*! @/Jetstream/Button.vue */ "./resources/js/Jetstream/Button.vue");
+/* harmony import */ var _Jetstream_Input_vue__WEBPACK_IMPORTED_MODULE_7__ = __webpack_require__(/*! @/Jetstream/Input.vue */ "./resources/js/Jetstream/Input.vue");
+/* harmony import */ var _inertiajs_inertia_vue3__WEBPACK_IMPORTED_MODULE_8__ = __webpack_require__(/*! @inertiajs/inertia-vue3 */ "./node_modules/@inertiajs/inertia-vue3/dist/index.js");
+/* harmony import */ var _iconify_vue__WEBPACK_IMPORTED_MODULE_9__ = __webpack_require__(/*! @iconify/vue */ "./node_modules/@iconify/vue/dist/iconify.mjs");
+
+
+
 
 
 
@@ -19765,14 +19991,17 @@ __webpack_require__.r(__webpack_exports__);
     title: String
   },
   components: {
-    Head: _inertiajs_inertia_vue3__WEBPACK_IMPORTED_MODULE_6__.Head,
+    Head: _inertiajs_inertia_vue3__WEBPACK_IMPORTED_MODULE_8__.Head,
     JetApplicationMark: _Jetstream_ApplicationMark_vue__WEBPACK_IMPORTED_MODULE_0__.default,
     JetBanner: _Jetstream_Banner_vue__WEBPACK_IMPORTED_MODULE_1__.default,
     JetDropdown: _Jetstream_Dropdown_vue__WEBPACK_IMPORTED_MODULE_2__.default,
     JetDropdownLink: _Jetstream_DropdownLink_vue__WEBPACK_IMPORTED_MODULE_3__.default,
     JetNavLink: _Jetstream_NavLink_vue__WEBPACK_IMPORTED_MODULE_4__.default,
     JetResponsiveNavLink: _Jetstream_ResponsiveNavLink_vue__WEBPACK_IMPORTED_MODULE_5__.default,
-    Link: _inertiajs_inertia_vue3__WEBPACK_IMPORTED_MODULE_6__.Link
+    JetButton: _Jetstream_Button_vue__WEBPACK_IMPORTED_MODULE_6__.default,
+    JetInput: _Jetstream_Input_vue__WEBPACK_IMPORTED_MODULE_7__.default,
+    Icon: _iconify_vue__WEBPACK_IMPORTED_MODULE_9__.Icon,
+    Link: _inertiajs_inertia_vue3__WEBPACK_IMPORTED_MODULE_8__.Link
   },
   data: function data() {
     return {
@@ -20394,10 +20623,56 @@ __webpack_require__.r(__webpack_exports__);
 
 /***/ }),
 
+/***/ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Doacoes.vue?vue&type=script&lang=js":
+/*!********************************************************************************************************************************************************************************************!*\
+  !*** ./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Doacoes.vue?vue&type=script&lang=js ***!
+  \********************************************************************************************************************************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (__WEBPACK_DEFAULT_EXPORT__)
+/* harmony export */ });
+/* harmony import */ var _Layouts_AppLayout_vue__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! @/Layouts/AppLayout.vue */ "./resources/js/Layouts/AppLayout.vue");
+/* harmony import */ var _Jetstream_Welcome_vue__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! @/Jetstream/Welcome.vue */ "./resources/js/Jetstream/Welcome.vue");
+
+
+/* harmony default export */ const __WEBPACK_DEFAULT_EXPORT__ = ({
+  components: {
+    AppLayout: _Layouts_AppLayout_vue__WEBPACK_IMPORTED_MODULE_0__.default
+  }
+});
+
+/***/ }),
+
 /***/ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Home.vue?vue&type=script&lang=js":
 /*!*****************************************************************************************************************************************************************************************!*\
   !*** ./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Home.vue?vue&type=script&lang=js ***!
   \*****************************************************************************************************************************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (__WEBPACK_DEFAULT_EXPORT__)
+/* harmony export */ });
+/* harmony import */ var _Layouts_AppLayout_vue__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! @/Layouts/AppLayout.vue */ "./resources/js/Layouts/AppLayout.vue");
+/* harmony import */ var _Jetstream_Welcome_vue__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! @/Jetstream/Welcome.vue */ "./resources/js/Jetstream/Welcome.vue");
+
+
+/* harmony default export */ const __WEBPACK_DEFAULT_EXPORT__ = ({
+  components: {
+    AppLayout: _Layouts_AppLayout_vue__WEBPACK_IMPORTED_MODULE_0__.default
+  }
+});
+
+/***/ }),
+
+/***/ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/MinhasDoacoes.vue?vue&type=script&lang=js":
+/*!**************************************************************************************************************************************************************************************************!*\
+  !*** ./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/MinhasDoacoes.vue?vue&type=script&lang=js ***!
+  \**************************************************************************************************************************************************************************************************/
 /***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
 
 "use strict";
@@ -20918,6 +21193,75 @@ __webpack_require__.r(__webpack_exports__);
     TwoFactorAuthenticationForm: _Pages_Profile_Partials_TwoFactorAuthenticationForm_vue__WEBPACK_IMPORTED_MODULE_4__.default,
     UpdatePasswordForm: _Pages_Profile_Partials_UpdatePasswordForm_vue__WEBPACK_IMPORTED_MODULE_5__.default,
     UpdateProfileInformationForm: _Pages_Profile_Partials_UpdateProfileInformationForm_vue__WEBPACK_IMPORTED_MODULE_6__.default
+  }
+});
+
+/***/ }),
+
+/***/ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/ProjetosCaridade.vue?vue&type=script&lang=js":
+/*!*****************************************************************************************************************************************************************************************************!*\
+  !*** ./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/ProjetosCaridade.vue?vue&type=script&lang=js ***!
+  \*****************************************************************************************************************************************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (__WEBPACK_DEFAULT_EXPORT__)
+/* harmony export */ });
+/* harmony import */ var _Layouts_AppLayout_vue__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! @/Layouts/AppLayout.vue */ "./resources/js/Layouts/AppLayout.vue");
+/* harmony import */ var _Jetstream_Welcome_vue__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! @/Jetstream/Welcome.vue */ "./resources/js/Jetstream/Welcome.vue");
+
+
+/* harmony default export */ const __WEBPACK_DEFAULT_EXPORT__ = ({
+  components: {
+    AppLayout: _Layouts_AppLayout_vue__WEBPACK_IMPORTED_MODULE_0__.default
+  }
+});
+
+/***/ }),
+
+/***/ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/QueroDoar.vue?vue&type=script&lang=js":
+/*!**********************************************************************************************************************************************************************************************!*\
+  !*** ./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/QueroDoar.vue?vue&type=script&lang=js ***!
+  \**********************************************************************************************************************************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (__WEBPACK_DEFAULT_EXPORT__)
+/* harmony export */ });
+/* harmony import */ var _Layouts_AppLayout_vue__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! @/Layouts/AppLayout.vue */ "./resources/js/Layouts/AppLayout.vue");
+/* harmony import */ var _Jetstream_Welcome_vue__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! @/Jetstream/Welcome.vue */ "./resources/js/Jetstream/Welcome.vue");
+
+
+/* harmony default export */ const __WEBPACK_DEFAULT_EXPORT__ = ({
+  components: {
+    AppLayout: _Layouts_AppLayout_vue__WEBPACK_IMPORTED_MODULE_0__.default
+  }
+});
+
+/***/ }),
+
+/***/ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/SobreNos.vue?vue&type=script&lang=js":
+/*!*********************************************************************************************************************************************************************************************!*\
+  !*** ./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/SobreNos.vue?vue&type=script&lang=js ***!
+  \*********************************************************************************************************************************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (__WEBPACK_DEFAULT_EXPORT__)
+/* harmony export */ });
+/* harmony import */ var _Layouts_AppLayout_vue__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! @/Layouts/AppLayout.vue */ "./resources/js/Layouts/AppLayout.vue");
+/* harmony import */ var _Jetstream_Welcome_vue__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! @/Jetstream/Welcome.vue */ "./resources/js/Jetstream/Welcome.vue");
+
+
+/* harmony default export */ const __WEBPACK_DEFAULT_EXPORT__ = ({
+  components: {
+    AppLayout: _Layouts_AppLayout_vue__WEBPACK_IMPORTED_MODULE_0__.default
   }
 });
 
@@ -22276,37 +22620,27 @@ var _hoisted_7 = {
   "class": "hidden space-x-8 sm:-my-px sm:ml-10 sm:flex "
 };
 
-var _hoisted_8 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("svg", {
-  xmlns: "http://www.w3.org/2000/svg",
-  x: "0px",
-  y: "0px",
-  width: "32",
-  height: "32",
-  viewBox: "0 0 172 172",
-  "class": " mr-2"
-}, [/*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("path", {
-  d: "M86,16.125c-38.52783,0 -69.875,31.34717 -69.875,69.875c0,38.52783 31.34717,69.875 69.875,69.875c38.52783,0 69.875,-31.34717 69.875,-69.875c0,-38.52783 -31.34717,-69.875 -69.875,-69.875zM86,26.875c32.71192,0 59.125,26.41309 59.125,59.125c0,32.71192 -26.41308,59.125 -59.125,59.125c-32.71191,0 -59.125,-26.41308 -59.125,-59.125c0,-32.71191 26.41309,-59.125 59.125,-59.125zM80.625,53.75v10.75h10.75v-10.75zM80.625,75.25v43h10.75v-43z"
-})], -1
-/* HOISTED */
-);
+var _hoisted_8 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Doações ");
 
-var _hoisted_9 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Sobre Nós ");
+var _hoisted_9 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Projetos ");
 
-var _hoisted_10 = {
+var _hoisted_10 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Sobre ");
+
+var _hoisted_11 = {
   "class": "hidden sm:flex sm:items-center sm:ml-6"
 };
-var _hoisted_11 = {
+var _hoisted_12 = {
   "class": "ml-3 relative"
 };
-var _hoisted_12 = {
+var _hoisted_13 = {
   "class": "inline-flex rounded-md"
 };
-var _hoisted_13 = {
+var _hoisted_14 = {
   type: "button",
   "class": "inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md text-gray-500 bg-white hover:bg-gray-50 hover:text-gray-700 focus:outline-none focus:bg-gray-50 active:bg-gray-50 transition"
 };
 
-var _hoisted_14 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("svg", {
+var _hoisted_15 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("svg", {
   "class": "ml-2 -mr-0.5 h-4 w-4",
   xmlns: "http://www.w3.org/2000/svg",
   viewBox: "0 0 20 20",
@@ -22319,37 +22653,37 @@ var _hoisted_14 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElement
 /* HOISTED */
 );
 
-var _hoisted_15 = {
+var _hoisted_16 = {
   "class": "w-60"
 };
 
-var _hoisted_16 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+var _hoisted_17 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
   "class": "block px-4 py-2 text-xs text-gray-400"
 }, " Manage Team ", -1
 /* HOISTED */
 );
 
-var _hoisted_17 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Team Settings ");
+var _hoisted_18 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Team Settings ");
 
-var _hoisted_18 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Create New Team ");
+var _hoisted_19 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Create New Team ");
 
-var _hoisted_19 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+var _hoisted_20 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
   "class": "border-t border-gray-100"
 }, null, -1
 /* HOISTED */
 );
 
-var _hoisted_20 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+var _hoisted_21 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
   "class": "block px-4 py-2 text-xs text-gray-400"
 }, " Switch Teams ", -1
 /* HOISTED */
 );
 
-var _hoisted_21 = ["onSubmit"];
-var _hoisted_22 = {
+var _hoisted_22 = ["onSubmit"];
+var _hoisted_23 = {
   "class": "flex items-center"
 };
-var _hoisted_23 = {
+var _hoisted_24 = {
   key: 0,
   "class": "mr-2 h-5 w-5 text-green-400",
   fill: "none",
@@ -22360,31 +22694,31 @@ var _hoisted_23 = {
   viewBox: "0 0 24 24"
 };
 
-var _hoisted_24 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("path", {
+var _hoisted_25 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("path", {
   d: "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
 }, null, -1
 /* HOISTED */
 );
 
-var _hoisted_25 = [_hoisted_24];
-var _hoisted_26 = {
+var _hoisted_26 = [_hoisted_25];
+var _hoisted_27 = {
   "class": "ml-3 relative"
 };
-var _hoisted_27 = {
+var _hoisted_28 = {
   key: 0,
   "class": "flex text-sm border-2 border-transparent rounded-full focus:outline-none focus:border-gray-300 transition"
 };
-var _hoisted_28 = ["src", "alt"];
-var _hoisted_29 = {
+var _hoisted_29 = ["src", "alt"];
+var _hoisted_30 = {
   key: 1,
   "class": "inline-flex rounded-md"
 };
-var _hoisted_30 = {
+var _hoisted_31 = {
   type: "button",
   "class": "inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md text-gray-500 bg-white hover:text-gray-700 focus:outline-none transition"
 };
 
-var _hoisted_31 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("svg", {
+var _hoisted_32 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("svg", {
   "class": "ml-2 -mr-0.5 h-4 w-4",
   xmlns: "http://www.w3.org/2000/svg",
   viewBox: "0 0 20 20",
@@ -22397,81 +22731,69 @@ var _hoisted_31 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElement
 /* HOISTED */
 );
 
-var _hoisted_32 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+var _hoisted_33 = {
   "class": "block px-4 py-2 text-xs text-gray-400"
-}, " Manage Account ", -1
-/* HOISTED */
-);
+};
 
-var _hoisted_33 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Profile ");
+var _hoisted_34 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Conta ");
 
-var _hoisted_34 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" API Tokens ");
+var _hoisted_35 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Perfil ");
 
-var _hoisted_35 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+var _hoisted_36 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Minhas Doações ");
+
+var _hoisted_37 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" API Tokens ");
+
+var _hoisted_38 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
   "class": "border-t border-gray-100"
 }, null, -1
 /* HOISTED */
 );
 
-var _hoisted_36 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Log Out ");
+var _hoisted_39 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Log Out ");
 
-var _hoisted_37 = {
+var _hoisted_40 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)("Quero Doar");
+
+var _hoisted_41 = {
   "class": "-mr-2 flex items-center sm:hidden"
 };
-var _hoisted_38 = {
+var _hoisted_42 = {
   "class": "h-6 w-6",
   stroke: "currentColor",
   fill: "none",
   viewBox: "0 0 24 24"
 };
-var _hoisted_39 = {
+var _hoisted_43 = {
   "class": "pt-2 pb-3 space-y-1"
 };
 
-var _hoisted_40 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Home ");
+var _hoisted_44 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Home ");
 
-var _hoisted_41 = {
+var _hoisted_45 = {
   "class": "pt-4 pb-1 border-t border-gray-200"
 };
-var _hoisted_42 = {
+var _hoisted_46 = {
   "class": "flex items-center px-4"
 };
-var _hoisted_43 = {
+var _hoisted_47 = {
   key: 0,
   "class": "flex-shrink-0 mr-3"
 };
-var _hoisted_44 = ["src", "alt"];
-var _hoisted_45 = {
+var _hoisted_48 = ["src", "alt"];
+var _hoisted_49 = {
   "class": "font-medium text-base text-gray-800"
 };
-var _hoisted_46 = {
+var _hoisted_50 = {
   "class": "font-medium text-sm text-gray-500"
 };
-var _hoisted_47 = {
+var _hoisted_51 = {
   "class": "mt-3 space-y-1"
 };
 
-var _hoisted_48 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Profile ");
+var _hoisted_52 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Profile ");
 
-var _hoisted_49 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" API Tokens ");
+var _hoisted_53 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" API Tokens ");
 
-var _hoisted_50 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Log Out ");
-
-var _hoisted_51 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
-  "class": "border-t border-gray-200"
-}, null, -1
-/* HOISTED */
-);
-
-var _hoisted_52 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
-  "class": "block px-4 py-2 text-xs text-gray-400"
-}, " Manage Team ", -1
-/* HOISTED */
-);
-
-var _hoisted_53 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Team Settings ");
-
-var _hoisted_54 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Create New Team ");
+var _hoisted_54 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Log Out ");
 
 var _hoisted_55 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
   "class": "border-t border-gray-200"
@@ -22481,15 +22803,31 @@ var _hoisted_55 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElement
 
 var _hoisted_56 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
   "class": "block px-4 py-2 text-xs text-gray-400"
+}, " Manage Team ", -1
+/* HOISTED */
+);
+
+var _hoisted_57 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Team Settings ");
+
+var _hoisted_58 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)(" Create New Team ");
+
+var _hoisted_59 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "border-t border-gray-200"
+}, null, -1
+/* HOISTED */
+);
+
+var _hoisted_60 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "block px-4 py-2 text-xs text-gray-400"
 }, " Switch Teams ", -1
 /* HOISTED */
 );
 
-var _hoisted_57 = ["onSubmit"];
-var _hoisted_58 = {
+var _hoisted_61 = ["onSubmit"];
+var _hoisted_62 = {
   "class": "flex items-center"
 };
-var _hoisted_59 = {
+var _hoisted_63 = {
   key: 0,
   "class": "mr-2 h-5 w-5 text-green-400",
   fill: "none",
@@ -22500,13 +22838,13 @@ var _hoisted_59 = {
   viewBox: "0 0 24 24"
 };
 
-var _hoisted_60 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("path", {
+var _hoisted_64 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("path", {
   d: "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
 }, null, -1
 /* HOISTED */
 );
 
-var _hoisted_61 = [_hoisted_60];
+var _hoisted_65 = [_hoisted_64];
 
 (0,vue__WEBPACK_IMPORTED_MODULE_0__.popScopeId)();
 
@@ -22519,11 +22857,15 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
 
   var _component_Link = (0,vue__WEBPACK_IMPORTED_MODULE_0__.resolveComponent)("Link");
 
+  var _component_Icon = (0,vue__WEBPACK_IMPORTED_MODULE_0__.resolveComponent)("Icon");
+
   var _component_jet_nav_link = (0,vue__WEBPACK_IMPORTED_MODULE_0__.resolveComponent)("jet-nav-link");
 
   var _component_jet_dropdown_link = (0,vue__WEBPACK_IMPORTED_MODULE_0__.resolveComponent)("jet-dropdown-link");
 
   var _component_jet_dropdown = (0,vue__WEBPACK_IMPORTED_MODULE_0__.resolveComponent)("jet-dropdown");
+
+  var _component_jet_button = (0,vue__WEBPACK_IMPORTED_MODULE_0__.resolveComponent)("jet-button");
 
   var _component_jet_responsive_nav_link = (0,vue__WEBPACK_IMPORTED_MODULE_0__.resolveComponent)("jet-responsive-nav-link");
 
@@ -22545,35 +22887,77 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
   }, 8
   /* PROPS */
   , ["href"])]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Navigation Links "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_7, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_nav_link, {
-    href: _ctx.route('home'),
-    active: _ctx.route().current('home')
+    href: _ctx.route('doacoes'),
+    active: _ctx.route().current('doacoes')
   }, {
     "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-      return [_hoisted_8, _hoisted_9];
+      return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_Icon, {
+        icon: "icon-park-outline:ad-product",
+        style: {
+          "font-size": "32px"
+        },
+        "class": "mr-2"
+      }), _hoisted_8];
     }),
     _: 1
     /* STABLE */
 
   }, 8
   /* PROPS */
-  , ["href", "active"])])]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_10, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_11, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Teams Dropdown "), _ctx.$page.props.jetstream.hasTeamFeatures ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createBlock)(_component_jet_dropdown, {
+  , ["href", "active"]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_nav_link, {
+    href: _ctx.route('projetos-caridade'),
+    active: _ctx.route().current('projetos-caridade')
+  }, {
+    "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_Icon, {
+        icon: "iconoir:donate",
+        style: {
+          "font-size": "32px"
+        },
+        "class": "mr-2"
+      }), _hoisted_9];
+    }),
+    _: 1
+    /* STABLE */
+
+  }, 8
+  /* PROPS */
+  , ["href", "active"]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_nav_link, {
+    href: _ctx.route('sobre-nos'),
+    active: _ctx.route().current('sobre-nos')
+  }, {
+    "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_Icon, {
+        icon: "ant-design:info-circle-outlined",
+        style: {
+          "font-size": "32px"
+        },
+        "class": "mr-2"
+      }), _hoisted_10];
+    }),
+    _: 1
+    /* STABLE */
+
+  }, 8
+  /* PROPS */
+  , ["href", "active"])])]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_11, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_12, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Teams Dropdown "), _ctx.$page.props.jetstream.hasTeamFeatures ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createBlock)(_component_jet_dropdown, {
     key: 0,
     align: "right",
     width: "60"
   }, {
     trigger: (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-      return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("span", _hoisted_12, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("button", _hoisted_13, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)((0,vue__WEBPACK_IMPORTED_MODULE_0__.toDisplayString)(_ctx.$page.props.user.current_team.name) + " ", 1
+      return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("span", _hoisted_13, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("button", _hoisted_14, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)((0,vue__WEBPACK_IMPORTED_MODULE_0__.toDisplayString)(_ctx.$page.props.user.current_team.name) + " ", 1
       /* TEXT */
-      ), _hoisted_14])])];
+      ), _hoisted_15])])];
     }),
     content: (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-      return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_15, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Team Management "), _ctx.$page.props.jetstream.hasTeamFeatures ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)(vue__WEBPACK_IMPORTED_MODULE_0__.Fragment, {
+      return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_16, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Team Management "), _ctx.$page.props.jetstream.hasTeamFeatures ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)(vue__WEBPACK_IMPORTED_MODULE_0__.Fragment, {
         key: 0
-      }, [_hoisted_16, (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Team Settings "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_dropdown_link, {
+      }, [_hoisted_17, (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Team Settings "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_dropdown_link, {
         href: _ctx.route('teams.show', _ctx.$page.props.user.current_team)
       }, {
         "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-          return [_hoisted_17];
+          return [_hoisted_18];
         }),
         _: 1
         /* STABLE */
@@ -22585,14 +22969,14 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
         href: _ctx.route('teams.create')
       }, {
         "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-          return [_hoisted_18];
+          return [_hoisted_19];
         }),
         _: 1
         /* STABLE */
 
       }, 8
       /* PROPS */
-      , ["href"])) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true), _hoisted_19, (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Team Switcher "), _hoisted_20, ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(true), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)(vue__WEBPACK_IMPORTED_MODULE_0__.Fragment, null, (0,vue__WEBPACK_IMPORTED_MODULE_0__.renderList)(_ctx.$page.props.user.all_teams, function (team) {
+      , ["href"])) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true), _hoisted_20, (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Team Switcher "), _hoisted_21, ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(true), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)(vue__WEBPACK_IMPORTED_MODULE_0__.Fragment, null, (0,vue__WEBPACK_IMPORTED_MODULE_0__.renderList)(_ctx.$page.props.user.all_teams, function (team) {
         return (0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("form", {
           key: team.id,
           onSubmit: (0,vue__WEBPACK_IMPORTED_MODULE_0__.withModifiers)(function ($event) {
@@ -22602,7 +22986,7 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
           as: "button"
         }, {
           "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-            return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_22, [team.id == _ctx.$page.props.user.current_team_id ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("svg", _hoisted_23, _hoisted_25)) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", null, (0,vue__WEBPACK_IMPORTED_MODULE_0__.toDisplayString)(team.name), 1
+            return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_23, [team.id == _ctx.$page.props.user.current_team_id ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("svg", _hoisted_24, _hoisted_26)) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", null, (0,vue__WEBPACK_IMPORTED_MODULE_0__.toDisplayString)(team.name), 1
             /* TEXT */
             )])];
           }),
@@ -22613,7 +22997,7 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
         /* DYNAMIC_SLOTS */
         )], 40
         /* PROPS, HYDRATE_EVENTS */
-        , _hoisted_21);
+        , _hoisted_22);
       }), 128
       /* KEYED_FRAGMENT */
       ))], 64
@@ -22623,27 +23007,44 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
     _: 1
     /* STABLE */
 
-  })) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true)]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Settings Dropdown "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_26, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_dropdown, {
+  })) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true)]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Settings Dropdown "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_27, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_dropdown, {
     align: "right",
     width: "48"
   }, {
     trigger: (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-      return [_ctx.$page.props.jetstream.managesProfilePhotos ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("button", _hoisted_27, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("img", {
+      return [_ctx.$page.props.jetstream.managesProfilePhotos ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("button", _hoisted_28, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("img", {
         "class": "h-10 w-10 rounded-full object-cover",
         src: _ctx.$page.props.user.profile_photo_url,
         alt: _ctx.$page.props.user.name
       }, null, 8
       /* PROPS */
-      , _hoisted_28)])) : ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("span", _hoisted_29, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("button", _hoisted_30, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)((0,vue__WEBPACK_IMPORTED_MODULE_0__.toDisplayString)(_ctx.$page.props.user.name) + " ", 1
+      , _hoisted_29)])) : ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("span", _hoisted_30, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("button", _hoisted_31, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createTextVNode)((0,vue__WEBPACK_IMPORTED_MODULE_0__.toDisplayString)(_ctx.$page.props.user.name) + " ", 1
       /* TEXT */
-      ), _hoisted_31])]))];
+      ), _hoisted_32])]))];
     }),
     content: (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-      return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Account Management "), _hoisted_32, (0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_dropdown_link, {
+      return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Account Management "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_33, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_Icon, {
+        icon: "healthicons:ui-user-profile-outline",
+        style: {
+          "font-size": "32px"
+        },
+        "class": ""
+      }), _hoisted_34]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_dropdown_link, {
         href: _ctx.route('profile.show')
       }, {
         "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-          return [_hoisted_33];
+          return [_hoisted_35];
+        }),
+        _: 1
+        /* STABLE */
+
+      }, 8
+      /* PROPS */
+      , ["href"]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_dropdown_link, {
+        href: _ctx.route('minhas-doacoes')
+      }, {
+        "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+          return [_hoisted_36];
         }),
         _: 1
         /* STABLE */
@@ -22655,14 +23056,14 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
         href: _ctx.route('api-tokens.index')
       }, {
         "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-          return [_hoisted_34];
+          return [_hoisted_37];
         }),
         _: 1
         /* STABLE */
 
       }, 8
       /* PROPS */
-      , ["href"])) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true), _hoisted_35, (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Authentication "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("form", {
+      , ["href"])) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true), _hoisted_38, (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Authentication "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("form", {
         onSubmit: _cache[0] || (_cache[0] = (0,vue__WEBPACK_IMPORTED_MODULE_0__.withModifiers)(function () {
           return $options.logout && $options.logout.apply($options, arguments);
         }, ["prevent"]))
@@ -22670,7 +23071,7 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
         as: "button"
       }, {
         "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-          return [_hoisted_36];
+          return [_hoisted_39];
         }),
         _: 1
         /* STABLE */
@@ -22682,12 +23083,24 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
     _: 1
     /* STABLE */
 
-  })])]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Hamburger "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_37, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("button", {
+  })]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_button, {
+    "class": "ml-4 rounded-full",
+    href: _ctx.route('quero-doar')
+  }, {
+    "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [_hoisted_40];
+    }),
+    _: 1
+    /* STABLE */
+
+  }, 8
+  /* PROPS */
+  , ["href"])]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Hamburger "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_41, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("button", {
     onClick: _cache[1] || (_cache[1] = function ($event) {
       return $data.showingNavigationDropdown = !$data.showingNavigationDropdown;
     }),
     "class": "inline-flex items-center justify-center p-2 rounded-md text-gray-400 hover:text-gray-500 hover:bg-gray-100 focus:outline-none focus:bg-gray-100 focus:text-gray-500 transition"
-  }, [((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("svg", _hoisted_38, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("path", {
+  }, [((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("svg", _hoisted_42, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("path", {
     "class": (0,vue__WEBPACK_IMPORTED_MODULE_0__.normalizeClass)({
       'hidden': $data.showingNavigationDropdown,
       'inline-flex': !$data.showingNavigationDropdown
@@ -22714,34 +23127,34 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
       'block': $data.showingNavigationDropdown,
       'hidden': !$data.showingNavigationDropdown
     }, "sm:hidden"])
-  }, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_39, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_responsive_nav_link, {
+  }, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_43, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_responsive_nav_link, {
     href: _ctx.route('home'),
     active: _ctx.route().current('home')
   }, {
     "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-      return [_hoisted_40];
+      return [_hoisted_44];
     }),
     _: 1
     /* STABLE */
 
   }, 8
   /* PROPS */
-  , ["href", "active"])]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Responsive Settings Options "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_41, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_42, [_ctx.$page.props.jetstream.managesProfilePhotos ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("div", _hoisted_43, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("img", {
+  , ["href", "active"])]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Responsive Settings Options "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_45, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_46, [_ctx.$page.props.jetstream.managesProfilePhotos ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("div", _hoisted_47, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("img", {
     "class": "h-10 w-10 rounded-full object-cover",
     src: _ctx.$page.props.user.profile_photo_url,
     alt: _ctx.$page.props.user.name
   }, null, 8
   /* PROPS */
-  , _hoisted_44)])) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", null, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_45, (0,vue__WEBPACK_IMPORTED_MODULE_0__.toDisplayString)(_ctx.$page.props.user.name), 1
+  , _hoisted_48)])) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", null, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_49, (0,vue__WEBPACK_IMPORTED_MODULE_0__.toDisplayString)(_ctx.$page.props.user.name), 1
   /* TEXT */
-  ), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_46, (0,vue__WEBPACK_IMPORTED_MODULE_0__.toDisplayString)(_ctx.$page.props.user.email), 1
+  ), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_50, (0,vue__WEBPACK_IMPORTED_MODULE_0__.toDisplayString)(_ctx.$page.props.user.email), 1
   /* TEXT */
-  )])]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_47, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_responsive_nav_link, {
+  )])]), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_51, [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_responsive_nav_link, {
     href: _ctx.route('profile.show'),
     active: _ctx.route().current('profile.show')
   }, {
     "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-      return [_hoisted_48];
+      return [_hoisted_52];
     }),
     _: 1
     /* STABLE */
@@ -22754,7 +23167,7 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
     active: _ctx.route().current('api-tokens.index')
   }, {
     "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-      return [_hoisted_49];
+      return [_hoisted_53];
     }),
     _: 1
     /* STABLE */
@@ -22770,7 +23183,7 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
     as: "button"
   }, {
     "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-      return [_hoisted_50];
+      return [_hoisted_54];
     }),
     _: 1
     /* STABLE */
@@ -22779,12 +23192,12 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
   /* HYDRATE_EVENTS */
   ), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Team Management "), _ctx.$page.props.jetstream.hasTeamFeatures ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)(vue__WEBPACK_IMPORTED_MODULE_0__.Fragment, {
     key: 1
-  }, [_hoisted_51, _hoisted_52, (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Team Settings "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_responsive_nav_link, {
+  }, [_hoisted_55, _hoisted_56, (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Team Settings "), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createVNode)(_component_jet_responsive_nav_link, {
     href: _ctx.route('teams.show', _ctx.$page.props.user.current_team),
     active: _ctx.route().current('teams.show')
   }, {
     "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-      return [_hoisted_53];
+      return [_hoisted_57];
     }),
     _: 1
     /* STABLE */
@@ -22797,14 +23210,14 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
     active: _ctx.route().current('teams.create')
   }, {
     "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-      return [_hoisted_54];
+      return [_hoisted_58];
     }),
     _: 1
     /* STABLE */
 
   }, 8
   /* PROPS */
-  , ["href", "active"])) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true), _hoisted_55, (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Team Switcher "), _hoisted_56, ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(true), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)(vue__WEBPACK_IMPORTED_MODULE_0__.Fragment, null, (0,vue__WEBPACK_IMPORTED_MODULE_0__.renderList)(_ctx.$page.props.user.all_teams, function (team) {
+  , ["href", "active"])) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true), _hoisted_59, (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)(" Team Switcher "), _hoisted_60, ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(true), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)(vue__WEBPACK_IMPORTED_MODULE_0__.Fragment, null, (0,vue__WEBPACK_IMPORTED_MODULE_0__.renderList)(_ctx.$page.props.user.all_teams, function (team) {
     return (0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("form", {
       key: team.id,
       onSubmit: (0,vue__WEBPACK_IMPORTED_MODULE_0__.withModifiers)(function ($event) {
@@ -22814,7 +23227,7 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
       as: "button"
     }, {
       "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
-        return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_58, [team.id == _ctx.$page.props.user.current_team_id ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("svg", _hoisted_59, _hoisted_61)) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", null, (0,vue__WEBPACK_IMPORTED_MODULE_0__.toDisplayString)(team.name), 1
+        return [(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", _hoisted_62, [team.id == _ctx.$page.props.user.current_team_id ? ((0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementBlock)("svg", _hoisted_63, _hoisted_65)) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", null, (0,vue__WEBPACK_IMPORTED_MODULE_0__.toDisplayString)(team.name), 1
         /* TEXT */
         )])];
       }),
@@ -22825,7 +23238,7 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
     /* DYNAMIC_SLOTS */
     )], 40
     /* PROPS, HYDRATE_EVENTS */
-    , _hoisted_57);
+    , _hoisted_61);
   }), 128
   /* KEYED_FRAGMENT */
   ))], 64
@@ -24723,6 +25136,56 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
 
 /***/ }),
 
+/***/ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Doacoes.vue?vue&type=template&id=0d574e92":
+/*!************************************************************************************************************************************************************************************************************************************************************************!*\
+  !*** ./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Doacoes.vue?vue&type=template&id=0d574e92 ***!
+  \************************************************************************************************************************************************************************************************************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "render": () => (/* binding */ render)
+/* harmony export */ });
+/* harmony import */ var vue__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! vue */ "./node_modules/vue/dist/vue.esm-bundler.js");
+
+
+var _hoisted_1 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("h2", {
+  "class": "font-semibold text-xl text-gray-800 leading-tight"
+}, " Todas Doações ", -1
+/* HOISTED */
+);
+
+var _hoisted_2 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "py-12"
+}, [/*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "max-w-7xl mx-auto sm:px-6 lg:px-8"
+}, [/*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "bg-white overflow-hidden shadow-xl sm:rounded-lg"
+})])], -1
+/* HOISTED */
+);
+
+function render(_ctx, _cache, $props, $setup, $data, $options) {
+  var _component_app_layout = (0,vue__WEBPACK_IMPORTED_MODULE_0__.resolveComponent)("app-layout");
+
+  return (0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createBlock)(_component_app_layout, {
+    title: "Todas Doações"
+  }, {
+    header: (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [_hoisted_1];
+    }),
+    "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [_hoisted_2];
+    }),
+    _: 1
+    /* STABLE */
+
+  });
+}
+
+/***/ }),
+
 /***/ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Home.vue?vue&type=template&id=6a63e488":
 /*!*********************************************************************************************************************************************************************************************************************************************************************!*\
   !*** ./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Home.vue?vue&type=template&id=6a63e488 ***!
@@ -24758,6 +25221,56 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
 
   return (0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createBlock)(_component_app_layout, {
     title: "Home"
+  }, {
+    header: (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [_hoisted_1];
+    }),
+    "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [_hoisted_2];
+    }),
+    _: 1
+    /* STABLE */
+
+  });
+}
+
+/***/ }),
+
+/***/ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/MinhasDoacoes.vue?vue&type=template&id=fa57fd62":
+/*!******************************************************************************************************************************************************************************************************************************************************************************!*\
+  !*** ./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/MinhasDoacoes.vue?vue&type=template&id=fa57fd62 ***!
+  \******************************************************************************************************************************************************************************************************************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "render": () => (/* binding */ render)
+/* harmony export */ });
+/* harmony import */ var vue__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! vue */ "./node_modules/vue/dist/vue.esm-bundler.js");
+
+
+var _hoisted_1 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("h2", {
+  "class": "font-semibold text-xl text-gray-800 leading-tight"
+}, " Minhas Doações ", -1
+/* HOISTED */
+);
+
+var _hoisted_2 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "py-12"
+}, [/*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "max-w-7xl mx-auto sm:px-6 lg:px-8"
+}, [/*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "bg-white overflow-hidden shadow-xl sm:rounded-lg"
+})])], -1
+/* HOISTED */
+);
+
+function render(_ctx, _cache, $props, $setup, $data, $options) {
+  var _component_app_layout = (0,vue__WEBPACK_IMPORTED_MODULE_0__.resolveComponent)("app-layout");
+
+  return (0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createBlock)(_component_app_layout, {
+    title: "Minhas Doações"
   }, {
     header: (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
       return [_hoisted_1];
@@ -26234,6 +26747,156 @@ function render(_ctx, _cache, $props, $setup, $data, $options) {
       })], 64
       /* STABLE_FRAGMENT */
       )) : (0,vue__WEBPACK_IMPORTED_MODULE_0__.createCommentVNode)("v-if", true)])])];
+    }),
+    _: 1
+    /* STABLE */
+
+  });
+}
+
+/***/ }),
+
+/***/ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/ProjetosCaridade.vue?vue&type=template&id=1e678368":
+/*!*********************************************************************************************************************************************************************************************************************************************************************************!*\
+  !*** ./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/ProjetosCaridade.vue?vue&type=template&id=1e678368 ***!
+  \*********************************************************************************************************************************************************************************************************************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "render": () => (/* binding */ render)
+/* harmony export */ });
+/* harmony import */ var vue__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! vue */ "./node_modules/vue/dist/vue.esm-bundler.js");
+
+
+var _hoisted_1 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("h2", {
+  "class": "font-semibold text-xl text-gray-800 leading-tight"
+}, " Projetos de Caridade ", -1
+/* HOISTED */
+);
+
+var _hoisted_2 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "py-12"
+}, [/*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "max-w-7xl mx-auto sm:px-6 lg:px-8"
+}, [/*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "bg-white overflow-hidden shadow-xl sm:rounded-lg"
+})])], -1
+/* HOISTED */
+);
+
+function render(_ctx, _cache, $props, $setup, $data, $options) {
+  var _component_app_layout = (0,vue__WEBPACK_IMPORTED_MODULE_0__.resolveComponent)("app-layout");
+
+  return (0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createBlock)(_component_app_layout, {
+    title: "Projetos de Caridade"
+  }, {
+    header: (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [_hoisted_1];
+    }),
+    "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [_hoisted_2];
+    }),
+    _: 1
+    /* STABLE */
+
+  });
+}
+
+/***/ }),
+
+/***/ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/QueroDoar.vue?vue&type=template&id=0361c381":
+/*!**************************************************************************************************************************************************************************************************************************************************************************!*\
+  !*** ./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/QueroDoar.vue?vue&type=template&id=0361c381 ***!
+  \**************************************************************************************************************************************************************************************************************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "render": () => (/* binding */ render)
+/* harmony export */ });
+/* harmony import */ var vue__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! vue */ "./node_modules/vue/dist/vue.esm-bundler.js");
+
+
+var _hoisted_1 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("h2", {
+  "class": "font-semibold text-xl text-gray-800 leading-tight"
+}, " Quero Doar ", -1
+/* HOISTED */
+);
+
+var _hoisted_2 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "py-12"
+}, [/*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "max-w-7xl mx-auto sm:px-6 lg:px-8"
+}, [/*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "bg-white overflow-hidden shadow-xl sm:rounded-lg"
+})])], -1
+/* HOISTED */
+);
+
+function render(_ctx, _cache, $props, $setup, $data, $options) {
+  var _component_app_layout = (0,vue__WEBPACK_IMPORTED_MODULE_0__.resolveComponent)("app-layout");
+
+  return (0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createBlock)(_component_app_layout, {
+    title: "Quero Doar"
+  }, {
+    header: (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [_hoisted_1];
+    }),
+    "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [_hoisted_2];
+    }),
+    _: 1
+    /* STABLE */
+
+  });
+}
+
+/***/ }),
+
+/***/ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/SobreNos.vue?vue&type=template&id=76488c02":
+/*!*************************************************************************************************************************************************************************************************************************************************************************!*\
+  !*** ./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/SobreNos.vue?vue&type=template&id=76488c02 ***!
+  \*************************************************************************************************************************************************************************************************************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "render": () => (/* binding */ render)
+/* harmony export */ });
+/* harmony import */ var vue__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! vue */ "./node_modules/vue/dist/vue.esm-bundler.js");
+
+
+var _hoisted_1 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("h2", {
+  "class": "font-semibold text-xl text-gray-800 leading-tight"
+}, " Sobre Nós ", -1
+/* HOISTED */
+);
+
+var _hoisted_2 = /*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "py-12"
+}, [/*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "max-w-7xl mx-auto sm:px-6 lg:px-8"
+}, [/*#__PURE__*/(0,vue__WEBPACK_IMPORTED_MODULE_0__.createElementVNode)("div", {
+  "class": "bg-white overflow-hidden shadow-xl sm:rounded-lg"
+})])], -1
+/* HOISTED */
+);
+
+function render(_ctx, _cache, $props, $setup, $data, $options) {
+  var _component_app_layout = (0,vue__WEBPACK_IMPORTED_MODULE_0__.resolveComponent)("app-layout");
+
+  return (0,vue__WEBPACK_IMPORTED_MODULE_0__.openBlock)(), (0,vue__WEBPACK_IMPORTED_MODULE_0__.createBlock)(_component_app_layout, {
+    title: "Sobre Nós"
+  }, {
+    header: (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [_hoisted_1];
+    }),
+    "default": (0,vue__WEBPACK_IMPORTED_MODULE_0__.withCtx)(function () {
+      return [_hoisted_2];
     }),
     _: 1
     /* STABLE */
@@ -51773,6 +52436,32 @@ _VerifyEmail_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.__
 
 /***/ }),
 
+/***/ "./resources/js/Pages/Doacoes.vue":
+/*!****************************************!*\
+  !*** ./resources/js/Pages/Doacoes.vue ***!
+  \****************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (__WEBPACK_DEFAULT_EXPORT__)
+/* harmony export */ });
+/* harmony import */ var _Doacoes_vue_vue_type_template_id_0d574e92__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./Doacoes.vue?vue&type=template&id=0d574e92 */ "./resources/js/Pages/Doacoes.vue?vue&type=template&id=0d574e92");
+/* harmony import */ var _Doacoes_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./Doacoes.vue?vue&type=script&lang=js */ "./resources/js/Pages/Doacoes.vue?vue&type=script&lang=js");
+
+
+
+_Doacoes_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.render = _Doacoes_vue_vue_type_template_id_0d574e92__WEBPACK_IMPORTED_MODULE_0__.render
+/* hot reload */
+if (false) {}
+
+_Doacoes_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.__file = "resources/js/Pages/Doacoes.vue"
+
+/* harmony default export */ const __WEBPACK_DEFAULT_EXPORT__ = (_Doacoes_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default);
+
+/***/ }),
+
 /***/ "./resources/js/Pages/Home.vue":
 /*!*************************************!*\
   !*** ./resources/js/Pages/Home.vue ***!
@@ -51796,6 +52485,32 @@ if (false) {}
 _Home_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.__file = "resources/js/Pages/Home.vue"
 
 /* harmony default export */ const __WEBPACK_DEFAULT_EXPORT__ = (_Home_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default);
+
+/***/ }),
+
+/***/ "./resources/js/Pages/MinhasDoacoes.vue":
+/*!**********************************************!*\
+  !*** ./resources/js/Pages/MinhasDoacoes.vue ***!
+  \**********************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (__WEBPACK_DEFAULT_EXPORT__)
+/* harmony export */ });
+/* harmony import */ var _MinhasDoacoes_vue_vue_type_template_id_fa57fd62__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./MinhasDoacoes.vue?vue&type=template&id=fa57fd62 */ "./resources/js/Pages/MinhasDoacoes.vue?vue&type=template&id=fa57fd62");
+/* harmony import */ var _MinhasDoacoes_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./MinhasDoacoes.vue?vue&type=script&lang=js */ "./resources/js/Pages/MinhasDoacoes.vue?vue&type=script&lang=js");
+
+
+
+_MinhasDoacoes_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.render = _MinhasDoacoes_vue_vue_type_template_id_fa57fd62__WEBPACK_IMPORTED_MODULE_0__.render
+/* hot reload */
+if (false) {}
+
+_MinhasDoacoes_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.__file = "resources/js/Pages/MinhasDoacoes.vue"
+
+/* harmony default export */ const __WEBPACK_DEFAULT_EXPORT__ = (_MinhasDoacoes_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default);
 
 /***/ }),
 
@@ -51978,6 +52693,84 @@ if (false) {}
 _Show_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.__file = "resources/js/Pages/Profile/Show.vue"
 
 /* harmony default export */ const __WEBPACK_DEFAULT_EXPORT__ = (_Show_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default);
+
+/***/ }),
+
+/***/ "./resources/js/Pages/ProjetosCaridade.vue":
+/*!*************************************************!*\
+  !*** ./resources/js/Pages/ProjetosCaridade.vue ***!
+  \*************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (__WEBPACK_DEFAULT_EXPORT__)
+/* harmony export */ });
+/* harmony import */ var _ProjetosCaridade_vue_vue_type_template_id_1e678368__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./ProjetosCaridade.vue?vue&type=template&id=1e678368 */ "./resources/js/Pages/ProjetosCaridade.vue?vue&type=template&id=1e678368");
+/* harmony import */ var _ProjetosCaridade_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./ProjetosCaridade.vue?vue&type=script&lang=js */ "./resources/js/Pages/ProjetosCaridade.vue?vue&type=script&lang=js");
+
+
+
+_ProjetosCaridade_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.render = _ProjetosCaridade_vue_vue_type_template_id_1e678368__WEBPACK_IMPORTED_MODULE_0__.render
+/* hot reload */
+if (false) {}
+
+_ProjetosCaridade_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.__file = "resources/js/Pages/ProjetosCaridade.vue"
+
+/* harmony default export */ const __WEBPACK_DEFAULT_EXPORT__ = (_ProjetosCaridade_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default);
+
+/***/ }),
+
+/***/ "./resources/js/Pages/QueroDoar.vue":
+/*!******************************************!*\
+  !*** ./resources/js/Pages/QueroDoar.vue ***!
+  \******************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (__WEBPACK_DEFAULT_EXPORT__)
+/* harmony export */ });
+/* harmony import */ var _QueroDoar_vue_vue_type_template_id_0361c381__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./QueroDoar.vue?vue&type=template&id=0361c381 */ "./resources/js/Pages/QueroDoar.vue?vue&type=template&id=0361c381");
+/* harmony import */ var _QueroDoar_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./QueroDoar.vue?vue&type=script&lang=js */ "./resources/js/Pages/QueroDoar.vue?vue&type=script&lang=js");
+
+
+
+_QueroDoar_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.render = _QueroDoar_vue_vue_type_template_id_0361c381__WEBPACK_IMPORTED_MODULE_0__.render
+/* hot reload */
+if (false) {}
+
+_QueroDoar_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.__file = "resources/js/Pages/QueroDoar.vue"
+
+/* harmony default export */ const __WEBPACK_DEFAULT_EXPORT__ = (_QueroDoar_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default);
+
+/***/ }),
+
+/***/ "./resources/js/Pages/SobreNos.vue":
+/*!*****************************************!*\
+  !*** ./resources/js/Pages/SobreNos.vue ***!
+  \*****************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (__WEBPACK_DEFAULT_EXPORT__)
+/* harmony export */ });
+/* harmony import */ var _SobreNos_vue_vue_type_template_id_76488c02__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./SobreNos.vue?vue&type=template&id=76488c02 */ "./resources/js/Pages/SobreNos.vue?vue&type=template&id=76488c02");
+/* harmony import */ var _SobreNos_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./SobreNos.vue?vue&type=script&lang=js */ "./resources/js/Pages/SobreNos.vue?vue&type=script&lang=js");
+
+
+
+_SobreNos_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.render = _SobreNos_vue_vue_type_template_id_76488c02__WEBPACK_IMPORTED_MODULE_0__.render
+/* hot reload */
+if (false) {}
+
+_SobreNos_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default.__file = "resources/js/Pages/SobreNos.vue"
+
+/* harmony default export */ const __WEBPACK_DEFAULT_EXPORT__ = (_SobreNos_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_1__.default);
 
 /***/ }),
 
@@ -52549,6 +53342,22 @@ __webpack_require__.r(__webpack_exports__);
 
 /***/ }),
 
+/***/ "./resources/js/Pages/Doacoes.vue?vue&type=script&lang=js":
+/*!****************************************************************!*\
+  !*** ./resources/js/Pages/Doacoes.vue?vue&type=script&lang=js ***!
+  \****************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_Doacoes_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__.default)
+/* harmony export */ });
+/* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_Doacoes_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./Doacoes.vue?vue&type=script&lang=js */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Doacoes.vue?vue&type=script&lang=js");
+ 
+
+/***/ }),
+
 /***/ "./resources/js/Pages/Home.vue?vue&type=script&lang=js":
 /*!*************************************************************!*\
   !*** ./resources/js/Pages/Home.vue?vue&type=script&lang=js ***!
@@ -52561,6 +53370,22 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   "default": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_Home_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__.default)
 /* harmony export */ });
 /* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_Home_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./Home.vue?vue&type=script&lang=js */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Home.vue?vue&type=script&lang=js");
+ 
+
+/***/ }),
+
+/***/ "./resources/js/Pages/MinhasDoacoes.vue?vue&type=script&lang=js":
+/*!**********************************************************************!*\
+  !*** ./resources/js/Pages/MinhasDoacoes.vue?vue&type=script&lang=js ***!
+  \**********************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_MinhasDoacoes_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__.default)
+/* harmony export */ });
+/* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_MinhasDoacoes_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./MinhasDoacoes.vue?vue&type=script&lang=js */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/MinhasDoacoes.vue?vue&type=script&lang=js");
  
 
 /***/ }),
@@ -52673,6 +53498,54 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   "default": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_Show_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__.default)
 /* harmony export */ });
 /* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_Show_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./Show.vue?vue&type=script&lang=js */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Profile/Show.vue?vue&type=script&lang=js");
+ 
+
+/***/ }),
+
+/***/ "./resources/js/Pages/ProjetosCaridade.vue?vue&type=script&lang=js":
+/*!*************************************************************************!*\
+  !*** ./resources/js/Pages/ProjetosCaridade.vue?vue&type=script&lang=js ***!
+  \*************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_ProjetosCaridade_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__.default)
+/* harmony export */ });
+/* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_ProjetosCaridade_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./ProjetosCaridade.vue?vue&type=script&lang=js */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/ProjetosCaridade.vue?vue&type=script&lang=js");
+ 
+
+/***/ }),
+
+/***/ "./resources/js/Pages/QueroDoar.vue?vue&type=script&lang=js":
+/*!******************************************************************!*\
+  !*** ./resources/js/Pages/QueroDoar.vue?vue&type=script&lang=js ***!
+  \******************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_QueroDoar_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__.default)
+/* harmony export */ });
+/* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_QueroDoar_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./QueroDoar.vue?vue&type=script&lang=js */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/QueroDoar.vue?vue&type=script&lang=js");
+ 
+
+/***/ }),
+
+/***/ "./resources/js/Pages/SobreNos.vue?vue&type=script&lang=js":
+/*!*****************************************************************!*\
+  !*** ./resources/js/Pages/SobreNos.vue?vue&type=script&lang=js ***!
+  \*****************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "default": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_SobreNos_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__.default)
+/* harmony export */ });
+/* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_SobreNos_vue_vue_type_script_lang_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./SobreNos.vue?vue&type=script&lang=js */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/SobreNos.vue?vue&type=script&lang=js");
  
 
 /***/ }),
@@ -53301,6 +54174,22 @@ __webpack_require__.r(__webpack_exports__);
 
 /***/ }),
 
+/***/ "./resources/js/Pages/Doacoes.vue?vue&type=template&id=0d574e92":
+/*!**********************************************************************!*\
+  !*** ./resources/js/Pages/Doacoes.vue?vue&type=template&id=0d574e92 ***!
+  \**********************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "render": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_Doacoes_vue_vue_type_template_id_0d574e92__WEBPACK_IMPORTED_MODULE_0__.render)
+/* harmony export */ });
+/* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_Doacoes_vue_vue_type_template_id_0d574e92__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./Doacoes.vue?vue&type=template&id=0d574e92 */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Doacoes.vue?vue&type=template&id=0d574e92");
+
+
+/***/ }),
+
 /***/ "./resources/js/Pages/Home.vue?vue&type=template&id=6a63e488":
 /*!*******************************************************************!*\
   !*** ./resources/js/Pages/Home.vue?vue&type=template&id=6a63e488 ***!
@@ -53313,6 +54202,22 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   "render": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_Home_vue_vue_type_template_id_6a63e488__WEBPACK_IMPORTED_MODULE_0__.render)
 /* harmony export */ });
 /* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_Home_vue_vue_type_template_id_6a63e488__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./Home.vue?vue&type=template&id=6a63e488 */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Home.vue?vue&type=template&id=6a63e488");
+
+
+/***/ }),
+
+/***/ "./resources/js/Pages/MinhasDoacoes.vue?vue&type=template&id=fa57fd62":
+/*!****************************************************************************!*\
+  !*** ./resources/js/Pages/MinhasDoacoes.vue?vue&type=template&id=fa57fd62 ***!
+  \****************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "render": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_MinhasDoacoes_vue_vue_type_template_id_fa57fd62__WEBPACK_IMPORTED_MODULE_0__.render)
+/* harmony export */ });
+/* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_MinhasDoacoes_vue_vue_type_template_id_fa57fd62__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./MinhasDoacoes.vue?vue&type=template&id=fa57fd62 */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/MinhasDoacoes.vue?vue&type=template&id=fa57fd62");
 
 
 /***/ }),
@@ -53425,6 +54330,54 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   "render": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_Show_vue_vue_type_template_id_348d746c__WEBPACK_IMPORTED_MODULE_0__.render)
 /* harmony export */ });
 /* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_Show_vue_vue_type_template_id_348d746c__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../../node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!../../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./Show.vue?vue&type=template&id=348d746c */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/Profile/Show.vue?vue&type=template&id=348d746c");
+
+
+/***/ }),
+
+/***/ "./resources/js/Pages/ProjetosCaridade.vue?vue&type=template&id=1e678368":
+/*!*******************************************************************************!*\
+  !*** ./resources/js/Pages/ProjetosCaridade.vue?vue&type=template&id=1e678368 ***!
+  \*******************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "render": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_ProjetosCaridade_vue_vue_type_template_id_1e678368__WEBPACK_IMPORTED_MODULE_0__.render)
+/* harmony export */ });
+/* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_ProjetosCaridade_vue_vue_type_template_id_1e678368__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./ProjetosCaridade.vue?vue&type=template&id=1e678368 */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/ProjetosCaridade.vue?vue&type=template&id=1e678368");
+
+
+/***/ }),
+
+/***/ "./resources/js/Pages/QueroDoar.vue?vue&type=template&id=0361c381":
+/*!************************************************************************!*\
+  !*** ./resources/js/Pages/QueroDoar.vue?vue&type=template&id=0361c381 ***!
+  \************************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "render": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_QueroDoar_vue_vue_type_template_id_0361c381__WEBPACK_IMPORTED_MODULE_0__.render)
+/* harmony export */ });
+/* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_QueroDoar_vue_vue_type_template_id_0361c381__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./QueroDoar.vue?vue&type=template&id=0361c381 */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/QueroDoar.vue?vue&type=template&id=0361c381");
+
+
+/***/ }),
+
+/***/ "./resources/js/Pages/SobreNos.vue?vue&type=template&id=76488c02":
+/*!***********************************************************************!*\
+  !*** ./resources/js/Pages/SobreNos.vue?vue&type=template&id=76488c02 ***!
+  \***********************************************************************/
+/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "render": () => (/* reexport safe */ _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_SobreNos_vue_vue_type_template_id_76488c02__WEBPACK_IMPORTED_MODULE_0__.render)
+/* harmony export */ });
+/* harmony import */ var _node_modules_babel_loader_lib_index_js_clonedRuleSet_5_use_0_node_modules_vue_loader_dist_templateLoader_js_ruleSet_1_rules_2_node_modules_vue_loader_dist_index_js_ruleSet_0_use_0_SobreNos_vue_vue_type_template_id_76488c02__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! -!../../../node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!../../../node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!../../../node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./SobreNos.vue?vue&type=template&id=76488c02 */ "./node_modules/babel-loader/lib/index.js??clonedRuleSet-5.use[0]!./node_modules/vue-loader/dist/templateLoader.js??ruleSet[1].rules[2]!./node_modules/vue-loader/dist/index.js??ruleSet[0].use[0]!./resources/js/Pages/SobreNos.vue?vue&type=template&id=76488c02");
 
 
 /***/ }),
@@ -53761,7 +54714,9 @@ var map = {
 	"./Auth/ResetPassword.vue": "./resources/js/Pages/Auth/ResetPassword.vue",
 	"./Auth/TwoFactorChallenge.vue": "./resources/js/Pages/Auth/TwoFactorChallenge.vue",
 	"./Auth/VerifyEmail.vue": "./resources/js/Pages/Auth/VerifyEmail.vue",
+	"./Doacoes.vue": "./resources/js/Pages/Doacoes.vue",
 	"./Home.vue": "./resources/js/Pages/Home.vue",
+	"./MinhasDoacoes.vue": "./resources/js/Pages/MinhasDoacoes.vue",
 	"./PrivacyPolicy.vue": "./resources/js/Pages/PrivacyPolicy.vue",
 	"./Profile/Partials/DeleteUserForm.vue": "./resources/js/Pages/Profile/Partials/DeleteUserForm.vue",
 	"./Profile/Partials/LogoutOtherBrowserSessionsForm.vue": "./resources/js/Pages/Profile/Partials/LogoutOtherBrowserSessionsForm.vue",
@@ -53769,6 +54724,9 @@ var map = {
 	"./Profile/Partials/UpdatePasswordForm.vue": "./resources/js/Pages/Profile/Partials/UpdatePasswordForm.vue",
 	"./Profile/Partials/UpdateProfileInformationForm.vue": "./resources/js/Pages/Profile/Partials/UpdateProfileInformationForm.vue",
 	"./Profile/Show.vue": "./resources/js/Pages/Profile/Show.vue",
+	"./ProjetosCaridade.vue": "./resources/js/Pages/ProjetosCaridade.vue",
+	"./QueroDoar.vue": "./resources/js/Pages/QueroDoar.vue",
+	"./SobreNos.vue": "./resources/js/Pages/SobreNos.vue",
 	"./TermsOfService.vue": "./resources/js/Pages/TermsOfService.vue",
 	"./Welcome.vue": "./resources/js/Pages/Welcome.vue"
 };
@@ -53802,6 +54760,3048 @@ webpackContext.id = "./resources/js/Pages sync recursive ^\\.\\/.*\\.vue$";
 /***/ (() => {
 
 /* (ignored) */
+
+/***/ }),
+
+/***/ "./node_modules/@iconify/vue/dist/iconify.mjs":
+/*!****************************************************!*\
+  !*** ./node_modules/@iconify/vue/dist/iconify.mjs ***!
+  \****************************************************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __webpack_require__) => {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   "Icon": () => (/* binding */ Icon),
+/* harmony export */   "_api": () => (/* binding */ _api),
+/* harmony export */   "addAPIProvider": () => (/* binding */ addAPIProvider),
+/* harmony export */   "addCollection": () => (/* binding */ addCollection),
+/* harmony export */   "addIcon": () => (/* binding */ addIcon),
+/* harmony export */   "buildIcon": () => (/* binding */ buildIcon),
+/* harmony export */   "calculateSize": () => (/* binding */ calculateSize),
+/* harmony export */   "disableCache": () => (/* binding */ disableCache),
+/* harmony export */   "enableCache": () => (/* binding */ enableCache),
+/* harmony export */   "getIcon": () => (/* binding */ getIcon),
+/* harmony export */   "iconExists": () => (/* binding */ iconExists),
+/* harmony export */   "listIcons": () => (/* binding */ listIcons),
+/* harmony export */   "loadIcons": () => (/* binding */ loadIcons),
+/* harmony export */   "replaceIDs": () => (/* binding */ replaceIDs)
+/* harmony export */ });
+/* harmony import */ var vue__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! vue */ "./node_modules/vue/dist/vue.esm-bundler.js");
+
+
+var name = {};
+
+var icon = {};
+
+(function (exports) {
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.fullIcon = exports.iconDefaults = exports.minifyProps = exports.matchName = void 0;
+/**
+ * Expression to test part of icon name.
+ */
+exports.matchName = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+/**
+ * Properties that can be minified
+ *
+ * Values of all these properties are awalys numbers
+ */
+exports.minifyProps = [
+    // All IconifyDimenisons properties
+    'width',
+    'height',
+    'top',
+    'left',
+];
+/**
+ * Default values for all optional IconifyIcon properties
+ */
+exports.iconDefaults = Object.freeze({
+    left: 0,
+    top: 0,
+    width: 16,
+    height: 16,
+    rotate: 0,
+    vFlip: false,
+    hFlip: false,
+});
+/**
+ * Add optional properties to icon
+ */
+function fullIcon(data) {
+    return { ...exports.iconDefaults, ...data };
+}
+exports.fullIcon = fullIcon;
+}(icon));
+
+(function (exports) {
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.validateIcon = exports.stringToIcon = void 0;
+const _1 = icon;
+/**
+ * Convert string to Icon object.
+ */
+const stringToIcon = (value, validate, allowSimpleName, provider = '') => {
+    const colonSeparated = value.split(':');
+    // Check for provider with correct '@' at start
+    if (value.slice(0, 1) === '@') {
+        // First part is provider
+        if (colonSeparated.length < 2 || colonSeparated.length > 3) {
+            // "@provider:prefix:name" or "@provider:prefix-name"
+            return null;
+        }
+        provider = colonSeparated.shift().slice(1);
+    }
+    // Check split by colon: "prefix:name", "provider:prefix:name"
+    if (colonSeparated.length > 3 || !colonSeparated.length) {
+        return null;
+    }
+    if (colonSeparated.length > 1) {
+        // "prefix:name"
+        const name = colonSeparated.pop();
+        const prefix = colonSeparated.pop();
+        const result = {
+            // Allow provider without '@': "provider:prefix:name"
+            provider: colonSeparated.length > 0 ? colonSeparated[0] : provider,
+            prefix,
+            name,
+        };
+        return validate && !exports.validateIcon(result) ? null : result;
+    }
+    // Attempt to split by dash: "prefix-name"
+    const name = colonSeparated[0];
+    const dashSeparated = name.split('-');
+    if (dashSeparated.length > 1) {
+        const result = {
+            provider: provider,
+            prefix: dashSeparated.shift(),
+            name: dashSeparated.join('-'),
+        };
+        return validate && !exports.validateIcon(result) ? null : result;
+    }
+    // If allowEmpty is set, allow empty provider and prefix, allowing names like "home"
+    if (allowSimpleName && provider === '') {
+        const result = {
+            provider: provider,
+            prefix: '',
+            name,
+        };
+        return validate && !exports.validateIcon(result, allowSimpleName)
+            ? null
+            : result;
+    }
+    return null;
+};
+exports.stringToIcon = stringToIcon;
+/**
+ * Check if icon is valid.
+ *
+ * This function is not part of stringToIcon because validation is not needed for most code.
+ */
+const validateIcon = (icon, allowSimpleName) => {
+    if (!icon) {
+        return false;
+    }
+    return !!((icon.provider === '' || icon.provider.match(_1.matchName)) &&
+        ((allowSimpleName && icon.prefix === '') ||
+            icon.prefix.match(_1.matchName)) &&
+        icon.name.match(_1.matchName));
+};
+exports.validateIcon = validateIcon;
+}(name));
+
+var functions$3 = {};
+
+var parse = {};
+
+var merge = {};
+
+Object.defineProperty(merge, "__esModule", { value: true });
+merge.mergeIconData = void 0;
+const _1$1 = icon;
+/**
+ * Merge icon and alias
+ */
+function mergeIconData(icon, alias) {
+    const result = { ...icon };
+    for (const key in _1$1.iconDefaults) {
+        const prop = key;
+        if (alias[prop] !== void 0) {
+            const value = alias[prop];
+            if (result[prop] === void 0) {
+                // Missing value
+                result[prop] = value;
+                continue;
+            }
+            switch (prop) {
+                case 'rotate':
+                    result[prop] =
+                        (result[prop] + value) % 4;
+                    break;
+                case 'hFlip':
+                case 'vFlip':
+                    result[prop] = value !== result[prop];
+                    break;
+                default:
+                    // Overwrite value
+                    result[prop] =
+                        value;
+            }
+        }
+    }
+    return result;
+}
+merge.mergeIconData = mergeIconData;
+
+Object.defineProperty(parse, "__esModule", { value: true });
+parse.parseIconSet = void 0;
+const icon_1$2 = icon;
+const merge_1 = merge;
+/**
+ * Get list of defaults keys
+ */
+const defaultsKeys = Object.keys(icon_1$2.iconDefaults);
+/**
+ * Resolve alias
+ */
+function resolveAlias(alias, icons, aliases, level = 0) {
+    const parent = alias.parent;
+    if (icons[parent] !== void 0) {
+        return merge_1.mergeIconData(icons[parent], alias);
+    }
+    if (aliases[parent] !== void 0) {
+        if (level > 2) {
+            // icon + alias + alias + alias = too much nesting, possibly infinite
+            return null;
+        }
+        const icon = resolveAlias(aliases[parent], icons, aliases, level + 1);
+        if (icon) {
+            return merge_1.mergeIconData(icon, alias);
+        }
+    }
+    return null;
+}
+/**
+ * Extract icons from an icon set
+ */
+function parseIconSet(data, callback, list = 'none') {
+    const added = [];
+    // Must be an object
+    if (typeof data !== 'object') {
+        return list === 'none' ? false : added;
+    }
+    // Check for missing icons list returned by API
+    if (data.not_found instanceof Array) {
+        data.not_found.forEach((name) => {
+            callback(name, null);
+            if (list === 'all') {
+                added.push(name);
+            }
+        });
+    }
+    // Must have 'icons' object
+    if (typeof data.icons !== 'object') {
+        return list === 'none' ? false : added;
+    }
+    // Get default values
+    const defaults = Object.create(null);
+    defaultsKeys.forEach((key) => {
+        if (data[key] !== void 0 && typeof data[key] !== 'object') {
+            defaults[key] = data[key];
+        }
+    });
+    // Get icons
+    const icons = data.icons;
+    Object.keys(icons).forEach((name) => {
+        const icon = icons[name];
+        if (typeof icon.body !== 'string') {
+            return;
+        }
+        // Freeze icon to make sure it will not be modified
+        callback(name, Object.freeze({ ...icon_1$2.iconDefaults, ...defaults, ...icon }));
+        added.push(name);
+    });
+    // Get aliases
+    if (typeof data.aliases === 'object') {
+        const aliases = data.aliases;
+        Object.keys(aliases).forEach((name) => {
+            const icon = resolveAlias(aliases[name], icons, aliases, 1);
+            if (icon) {
+                // Freeze icon to make sure it will not be modified
+                callback(name, Object.freeze({ ...icon_1$2.iconDefaults, ...defaults, ...icon }));
+                added.push(name);
+            }
+        });
+    }
+    return list === 'none' ? added.length > 0 : added;
+}
+parse.parseIconSet = parseIconSet;
+
+var storage$2 = {};
+
+Object.defineProperty(storage$2, "__esModule", { value: true });
+storage$2.listIcons = storage$2.getIcon = storage$2.iconExists = storage$2.addIcon = storage$2.addIconSet = storage$2.getStorage = storage$2.newStorage = void 0;
+const icon_1$1 = icon;
+const parse_1$1 = parse;
+/**
+ * Storage by provider and prefix
+ */
+const storage$1 = Object.create(null);
+/**
+ * Create new storage
+ */
+function newStorage(provider, prefix) {
+    return {
+        provider,
+        prefix,
+        icons: Object.create(null),
+        missing: Object.create(null),
+    };
+}
+storage$2.newStorage = newStorage;
+/**
+ * Get storage for provider and prefix
+ */
+function getStorage(provider, prefix) {
+    if (storage$1[provider] === void 0) {
+        storage$1[provider] = Object.create(null);
+    }
+    const providerStorage = storage$1[provider];
+    if (providerStorage[prefix] === void 0) {
+        providerStorage[prefix] = newStorage(provider, prefix);
+    }
+    return providerStorage[prefix];
+}
+storage$2.getStorage = getStorage;
+/**
+ * Add icon set to storage
+ *
+ * Returns array of added icons if 'list' is true and icons were added successfully
+ */
+function addIconSet(storage, data, list = 'none') {
+    const t = Date.now();
+    return parse_1$1.parseIconSet(data, (name, icon) => {
+        if (icon === null) {
+            storage.missing[name] = t;
+        }
+        else {
+            storage.icons[name] = icon;
+        }
+    }, list);
+}
+storage$2.addIconSet = addIconSet;
+/**
+ * Add icon to storage
+ */
+function addIcon$2(storage, name, icon) {
+    try {
+        if (typeof icon.body === 'string') {
+            // Freeze icon to make sure it will not be modified
+            storage.icons[name] = Object.freeze(icon_1$1.fullIcon(icon));
+            return true;
+        }
+    }
+    catch (err) {
+        // Do nothing
+    }
+    return false;
+}
+storage$2.addIcon = addIcon$2;
+/**
+ * Check if icon exists
+ */
+function iconExists$1(storage, name) {
+    return storage.icons[name] !== void 0;
+}
+storage$2.iconExists = iconExists$1;
+/**
+ * Get icon data
+ */
+function getIcon$1(storage, name) {
+    const value = storage.icons[name];
+    return value === void 0 ? null : value;
+}
+storage$2.getIcon = getIcon$1;
+/**
+ * List available icons
+ */
+function listIcons$1(provider, prefix) {
+    let allIcons = [];
+    // Get providers
+    let providers;
+    if (typeof provider === 'string') {
+        providers = [provider];
+    }
+    else {
+        providers = Object.keys(storage$1);
+    }
+    // Get all icons
+    providers.forEach((provider) => {
+        let prefixes;
+        if (typeof provider === 'string' && typeof prefix === 'string') {
+            prefixes = [prefix];
+        }
+        else {
+            prefixes =
+                storage$1[provider] === void 0
+                    ? []
+                    : Object.keys(storage$1[provider]);
+        }
+        prefixes.forEach((prefix) => {
+            const storage = getStorage(provider, prefix);
+            const icons = Object.keys(storage.icons).map((name) => (provider !== '' ? '@' + provider + ':' : '') +
+                prefix +
+                ':' +
+                name);
+            allIcons = allIcons.concat(icons);
+        });
+    });
+    return allIcons;
+}
+storage$2.listIcons = listIcons$1;
+
+Object.defineProperty(functions$3, "__esModule", { value: true });
+var storageFunctions = functions$3.storageFunctions = functions$3.addCollection = functions$3.addIcon = getIconData_1 = functions$3.getIconData = allowSimpleNames_1 = functions$3.allowSimpleNames = void 0;
+const parse_1 = parse;
+const name_1$1 = name;
+const storage_1$2 = storage$2;
+/**
+ * Allow storing icons without provider or prefix, making it possible to store icons like "home"
+ */
+let simpleNames = false;
+function allowSimpleNames(allow) {
+    if (typeof allow === 'boolean') {
+        simpleNames = allow;
+    }
+    return simpleNames;
+}
+var allowSimpleNames_1 = functions$3.allowSimpleNames = allowSimpleNames;
+/**
+ * Get icon data
+ */
+function getIconData(name) {
+    const icon = typeof name === 'string' ? name_1$1.stringToIcon(name, true, simpleNames) : name;
+    return icon
+        ? storage_1$2.getIcon(storage_1$2.getStorage(icon.provider, icon.prefix), icon.name)
+        : null;
+}
+var getIconData_1 = functions$3.getIconData = getIconData;
+/**
+ * Add one icon
+ */
+function addIcon$1(name, data) {
+    const icon = name_1$1.stringToIcon(name, true, simpleNames);
+    if (!icon) {
+        return false;
+    }
+    const storage = storage_1$2.getStorage(icon.provider, icon.prefix);
+    return storage_1$2.addIcon(storage, icon.name, data);
+}
+functions$3.addIcon = addIcon$1;
+/**
+ * Add icon set
+ */
+function addCollection$1(data, provider) {
+    if (typeof data !== 'object') {
+        return false;
+    }
+    // Get provider
+    if (typeof provider !== 'string') {
+        provider = typeof data.provider === 'string' ? data.provider : '';
+    }
+    // Check for simple names: requires empty provider and prefix
+    if (simpleNames &&
+        provider === '' &&
+        (typeof data.prefix !== 'string' || data.prefix === '')) {
+        // Simple names: add icons one by one
+        let added = false;
+        parse_1.parseIconSet(data, (name, icon) => {
+            if (icon !== null && addIcon$1(name, icon)) {
+                added = true;
+            }
+        });
+        return added;
+    }
+    // Validate provider and prefix
+    if (typeof data.prefix !== 'string' ||
+        !name_1$1.validateIcon({
+            provider,
+            prefix: data.prefix,
+            name: 'a',
+        })) {
+        return false;
+    }
+    const storage = storage_1$2.getStorage(provider, data.prefix);
+    return !!storage_1$2.addIconSet(storage, data);
+}
+functions$3.addCollection = addCollection$1;
+/**
+ * Export
+ */
+storageFunctions = functions$3.storageFunctions = {
+    // Check if icon exists
+    iconExists: (name) => getIconData(name) !== null,
+    // Get raw icon data
+    getIcon: (name) => {
+        const result = getIconData(name);
+        return result ? { ...result } : null;
+    },
+    // List icons
+    listIcons: storage_1$2.listIcons,
+    // Add icon
+    addIcon: addIcon$1,
+    // Add icon set
+    addCollection: addCollection$1,
+};
+
+var functions$2 = {};
+
+var id = {};
+
+Object.defineProperty(id, "__esModule", { value: true });
+var replaceIDs_1 = id.replaceIDs = void 0;
+/**
+ * Regular expression for finding ids
+ */
+const regex = /\sid="(\S+)"/g;
+/**
+ * Match for allowed characters before and after id in replacement, including () for group
+ */
+const replaceValue = '([^A-Za-z0-9_-])';
+/**
+ * Escape value for 'new RegExp()'
+ */
+function escapeRegExp(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the whole matched string
+}
+/**
+ * New random-ish prefix for ids
+ */
+const randomPrefix = 'IconifyId-' +
+    Date.now().toString(16) +
+    '-' +
+    ((Math.random() * 0x1000000) | 0).toString(16) +
+    '-';
+/**
+ * Counter for ids, increasing with every replacement
+ */
+let counter = 0;
+/**
+ * Replace IDs in SVG output with unique IDs
+ * Fast replacement without parsing XML, assuming commonly used patterns and clean XML (icon should have been cleaned up with Iconify Tools or SVGO).
+ */
+function replaceIDs$1(body, prefix = randomPrefix) {
+    // Find all IDs
+    const ids = [];
+    let match;
+    while ((match = regex.exec(body))) {
+        ids.push(match[1]);
+    }
+    if (!ids.length) {
+        return body;
+    }
+    // Replace with unique ids
+    ids.forEach((id) => {
+        const newID = typeof prefix === 'function' ? prefix() : prefix + counter++;
+        body = body.replace(new RegExp(replaceValue + '(' + escapeRegExp(id) + ')' + replaceValue, 'g'), '$1' + newID + '$3');
+    });
+    return body;
+}
+replaceIDs_1 = id.replaceIDs = replaceIDs$1;
+
+var size = {};
+
+Object.defineProperty(size, "__esModule", { value: true });
+size.calculateSize = void 0;
+/**
+ * Regular expressions for calculating dimensions
+ */
+const unitsSplit = /(-?[0-9.]*[0-9]+[0-9.]*)/g;
+const unitsTest = /^-?[0-9.]*[0-9]+[0-9.]*$/g;
+/**
+ * Calculate second dimension when only 1 dimension is set
+ *
+ * @param {string|number} size One dimension (such as width)
+ * @param {number} ratio Width/height ratio.
+ *      If size is width, ratio = height/width
+ *      If size is height, ratio = width/height
+ * @param {number} [precision] Floating number precision in result to minimize output. Default = 2
+ * @return {string|number} Another dimension
+ */
+function calculateSize$1(size, ratio, precision) {
+    if (ratio === 1) {
+        return size;
+    }
+    precision = precision === void 0 ? 100 : precision;
+    if (typeof size === 'number') {
+        return Math.ceil(size * ratio * precision) / precision;
+    }
+    if (typeof size !== 'string') {
+        return size;
+    }
+    // Split code into sets of strings and numbers
+    const oldParts = size.split(unitsSplit);
+    if (oldParts === null || !oldParts.length) {
+        return size;
+    }
+    const newParts = [];
+    let code = oldParts.shift();
+    let isNumber = unitsTest.test(code);
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+        if (isNumber) {
+            const num = parseFloat(code);
+            if (isNaN(num)) {
+                newParts.push(code);
+            }
+            else {
+                newParts.push(Math.ceil(num * ratio * precision) / precision);
+            }
+        }
+        else {
+            newParts.push(code);
+        }
+        // next
+        code = oldParts.shift();
+        if (code === void 0) {
+            return newParts.join('');
+        }
+        isNumber = !isNumber;
+    }
+}
+size.calculateSize = calculateSize$1;
+
+var customisations = {};
+
+Object.defineProperty(customisations, "__esModule", { value: true });
+var mergeCustomisations_1 = customisations.mergeCustomisations = defaults = customisations.defaults = void 0;
+/**
+ * Default icon customisations values
+ */
+var defaults = customisations.defaults = Object.freeze({
+    // Display mode
+    inline: false,
+    // Dimensions
+    width: null,
+    height: null,
+    // Alignment
+    hAlign: 'center',
+    vAlign: 'middle',
+    slice: false,
+    // Transformations
+    hFlip: false,
+    vFlip: false,
+    rotate: 0,
+});
+/**
+ * Convert IconifyIconCustomisations to FullIconCustomisations
+ */
+function mergeCustomisations(defaults, item) {
+    const result = {};
+    for (const key in defaults) {
+        const attr = key;
+        // Copy old value
+        result[attr] = defaults[attr];
+        if (item[attr] === void 0) {
+            continue;
+        }
+        // Validate new value
+        const value = item[attr];
+        switch (attr) {
+            // Boolean attributes that override old value
+            case 'inline':
+            case 'slice':
+                if (typeof value === 'boolean') {
+                    result[attr] = value;
+                }
+                break;
+            // Boolean attributes that are merged
+            case 'hFlip':
+            case 'vFlip':
+                if (value === true) {
+                    result[attr] = !result[attr];
+                }
+                break;
+            // Non-empty string
+            case 'hAlign':
+            case 'vAlign':
+                if (typeof value === 'string' && value !== '') {
+                    result[attr] = value;
+                }
+                break;
+            // Non-empty string / non-zero number / null
+            case 'width':
+            case 'height':
+                if ((typeof value === 'string' && value !== '') ||
+                    (typeof value === 'number' && value) ||
+                    value === null) {
+                    result[attr] = value;
+                }
+                break;
+            // Rotation
+            case 'rotate':
+                if (typeof value === 'number') {
+                    result[attr] += value;
+                }
+                break;
+        }
+    }
+    return result;
+}
+mergeCustomisations_1 = customisations.mergeCustomisations = mergeCustomisations;
+
+var build = {};
+
+Object.defineProperty(build, "__esModule", { value: true });
+var iconToSVG_1 = build.iconToSVG = void 0;
+const size_1$1 = size;
+/**
+ * Get preserveAspectRatio value
+ */
+function preserveAspectRatio(props) {
+    let result = '';
+    switch (props.hAlign) {
+        case 'left':
+            result += 'xMin';
+            break;
+        case 'right':
+            result += 'xMax';
+            break;
+        default:
+            result += 'xMid';
+    }
+    switch (props.vAlign) {
+        case 'top':
+            result += 'YMin';
+            break;
+        case 'bottom':
+            result += 'YMax';
+            break;
+        default:
+            result += 'YMid';
+    }
+    result += props.slice ? ' slice' : ' meet';
+    return result;
+}
+/**
+ * Get SVG attributes and content from icon + customisations
+ *
+ * Does not generate style to make it compatible with frameworks that use objects for style, such as React.
+ * Instead, it generates 'inline' value. If true, rendering engine should add verticalAlign: -0.125em to icon.
+ *
+ * Customisations should be normalised by platform specific parser.
+ * Result should be converted to <svg> by platform specific parser.
+ * Use replaceIDs to generate unique IDs for body.
+ */
+function iconToSVG(icon, customisations) {
+    // viewBox
+    const box = {
+        left: icon.left,
+        top: icon.top,
+        width: icon.width,
+        height: icon.height,
+    };
+    // Body
+    let body = icon.body;
+    // Apply transformations
+    [icon, customisations].forEach((props) => {
+        const transformations = [];
+        const hFlip = props.hFlip;
+        const vFlip = props.vFlip;
+        let rotation = props.rotate;
+        // Icon is flipped first, then rotated
+        if (hFlip) {
+            if (vFlip) {
+                rotation += 2;
+            }
+            else {
+                // Horizontal flip
+                transformations.push('translate(' +
+                    (box.width + box.left) +
+                    ' ' +
+                    (0 - box.top) +
+                    ')');
+                transformations.push('scale(-1 1)');
+                box.top = box.left = 0;
+            }
+        }
+        else if (vFlip) {
+            // Vertical flip
+            transformations.push('translate(' +
+                (0 - box.left) +
+                ' ' +
+                (box.height + box.top) +
+                ')');
+            transformations.push('scale(1 -1)');
+            box.top = box.left = 0;
+        }
+        let tempValue;
+        if (rotation < 0) {
+            rotation -= Math.floor(rotation / 4) * 4;
+        }
+        rotation = rotation % 4;
+        switch (rotation) {
+            case 1:
+                // 90deg
+                tempValue = box.height / 2 + box.top;
+                transformations.unshift('rotate(90 ' + tempValue + ' ' + tempValue + ')');
+                break;
+            case 2:
+                // 180deg
+                transformations.unshift('rotate(180 ' +
+                    (box.width / 2 + box.left) +
+                    ' ' +
+                    (box.height / 2 + box.top) +
+                    ')');
+                break;
+            case 3:
+                // 270deg
+                tempValue = box.width / 2 + box.left;
+                transformations.unshift('rotate(-90 ' + tempValue + ' ' + tempValue + ')');
+                break;
+        }
+        if (rotation % 2 === 1) {
+            // Swap width/height and x/y for 90deg or 270deg rotation
+            if (box.left !== 0 || box.top !== 0) {
+                tempValue = box.left;
+                box.left = box.top;
+                box.top = tempValue;
+            }
+            if (box.width !== box.height) {
+                tempValue = box.width;
+                box.width = box.height;
+                box.height = tempValue;
+            }
+        }
+        if (transformations.length) {
+            body =
+                '<g transform="' +
+                    transformations.join(' ') +
+                    '">' +
+                    body +
+                    '</g>';
+        }
+    });
+    // Calculate dimensions
+    let width, height;
+    if (customisations.width === null && customisations.height === null) {
+        // Set height to '1em', calculate width
+        height = '1em';
+        width = size_1$1.calculateSize(height, box.width / box.height);
+    }
+    else if (customisations.width !== null &&
+        customisations.height !== null) {
+        // Values are set
+        width = customisations.width;
+        height = customisations.height;
+    }
+    else if (customisations.height !== null) {
+        // Height is set
+        height = customisations.height;
+        width = size_1$1.calculateSize(height, box.width / box.height);
+    }
+    else {
+        // Width is set
+        width = customisations.width;
+        height = size_1$1.calculateSize(width, box.height / box.width);
+    }
+    // Check for 'auto'
+    if (width === 'auto') {
+        width = box.width;
+    }
+    if (height === 'auto') {
+        height = box.height;
+    }
+    // Convert to string
+    width = typeof width === 'string' ? width : width + '';
+    height = typeof height === 'string' ? height : height + '';
+    // Result
+    const result = {
+        attributes: {
+            width,
+            height,
+            preserveAspectRatio: preserveAspectRatio(customisations),
+            viewBox: box.left + ' ' + box.top + ' ' + box.width + ' ' + box.height,
+        },
+        body,
+    };
+    if (customisations.inline) {
+        result.inline = true;
+    }
+    return result;
+}
+iconToSVG_1 = build.iconToSVG = iconToSVG;
+
+Object.defineProperty(functions$2, "__esModule", { value: true });
+var builderFunctions = functions$2.builderFunctions = void 0;
+const icon_1 = icon;
+const id_1 = id;
+const size_1 = size;
+const customisations_1 = customisations;
+const build_1 = build;
+/**
+ * Exported builder functions
+ */
+builderFunctions = functions$2.builderFunctions = {
+    replaceIDs: id_1.replaceIDs,
+    calculateSize: size_1.calculateSize,
+    buildIcon: (icon, customisations) => {
+        return build_1.iconToSVG(icon_1.fullIcon(icon), customisations_1.mergeCustomisations(customisations_1.defaults, customisations));
+    },
+};
+
+var modules$1 = {};
+
+Object.defineProperty(modules$1, "__esModule", { value: true });
+var coreModules = modules$1.coreModules = void 0;
+coreModules = modules$1.coreModules = {};
+
+var api = {};
+
+var redundancy = {};
+
+var config$1 = {};
+
+Object.defineProperty(config$1, "__esModule", { value: true });
+config$1.defaultConfig = void 0;
+/**
+ * Default RedundancyConfig for API calls
+ */
+config$1.defaultConfig = {
+    resources: [],
+    index: 0,
+    timeout: 2000,
+    rotate: 750,
+    random: false,
+    dataAfterTimeout: false,
+};
+
+var query = {};
+
+Object.defineProperty(query, "__esModule", { value: true });
+query.sendQuery = void 0;
+/**
+ * Send query
+ */
+function sendQuery(config, payload, query, done, success) {
+    // Get number of resources
+    const resourcesCount = config.resources.length;
+    // Save start index
+    const startIndex = config.random
+        ? Math.floor(Math.random() * resourcesCount)
+        : config.index;
+    // Get resources
+    let resources;
+    if (config.random) {
+        // Randomise array
+        let list = config.resources.slice(0);
+        resources = [];
+        while (list.length > 1) {
+            const nextIndex = Math.floor(Math.random() * list.length);
+            resources.push(list[nextIndex]);
+            list = list.slice(0, nextIndex).concat(list.slice(nextIndex + 1));
+        }
+        resources = resources.concat(list);
+    }
+    else {
+        // Rearrange resources to start with startIndex
+        resources = config.resources
+            .slice(startIndex)
+            .concat(config.resources.slice(0, startIndex));
+    }
+    // Counters, status
+    const startTime = Date.now();
+    let status = 'pending';
+    let queriesSent = 0;
+    let lastError = void 0;
+    // Timer
+    let timer = null;
+    // Execution queue
+    let queue = [];
+    // Callbacks to call when query is complete
+    let doneCallbacks = [];
+    if (typeof done === 'function') {
+        doneCallbacks.push(done);
+    }
+    /**
+     * Reset timer
+     */
+    function resetTimer() {
+        if (timer) {
+            clearTimeout(timer);
+            timer = null;
+        }
+    }
+    /**
+     * Abort everything
+     */
+    function abort() {
+        // Change status
+        if (status === 'pending') {
+            status = 'aborted';
+        }
+        // Reset timer
+        resetTimer();
+        // Abort all queued items
+        queue.forEach((item) => {
+            if (item.abort) {
+                item.abort();
+            }
+            if (item.status === 'pending') {
+                item.status = 'aborted';
+            }
+        });
+        queue = [];
+    }
+    /**
+     * Add / replace callback to call when execution is complete.
+     * This can be used to abort pending query implementations when query is complete or aborted.
+     */
+    function subscribe(callback, overwrite) {
+        if (overwrite) {
+            doneCallbacks = [];
+        }
+        if (typeof callback === 'function') {
+            doneCallbacks.push(callback);
+        }
+    }
+    /**
+     * Get query status
+     */
+    function getQueryStatus() {
+        return {
+            startTime,
+            payload,
+            status,
+            queriesSent,
+            queriesPending: queue.length,
+            subscribe,
+            abort,
+        };
+    }
+    /**
+     * Fail query
+     */
+    function failQuery() {
+        status = 'failed';
+        // Send notice to all callbacks
+        doneCallbacks.forEach((callback) => {
+            callback(void 0, lastError);
+        });
+    }
+    /**
+     * Clear queue
+     */
+    function clearQueue() {
+        queue = queue.filter((item) => {
+            if (item.status === 'pending') {
+                item.status = 'aborted';
+            }
+            if (item.abort) {
+                item.abort();
+            }
+            return false;
+        });
+    }
+    /**
+     * Got response from module
+     */
+    function moduleResponse(item, data, error) {
+        const isError = data === void 0;
+        // Remove item from queue
+        queue = queue.filter((queued) => queued !== item);
+        // Check status
+        switch (status) {
+            case 'pending':
+                // Pending
+                break;
+            case 'failed':
+                if (isError || !config.dataAfterTimeout) {
+                    // Query has already timed out or dataAfterTimeout is disabled
+                    return;
+                }
+                // Success after failure
+                break;
+            default:
+                // Aborted or completed
+                return;
+        }
+        // Error
+        if (isError) {
+            if (error !== void 0) {
+                lastError = error;
+            }
+            if (!queue.length) {
+                if (!resources.length) {
+                    // Nothing else queued, nothing can be queued
+                    failQuery();
+                }
+                else {
+                    // Queue is empty: run next item immediately
+                    // eslint-disable-next-line @typescript-eslint/no-use-before-define
+                    execNext();
+                }
+            }
+            return;
+        }
+        // Reset timers, abort pending queries
+        resetTimer();
+        clearQueue();
+        // Update index in Redundancy
+        if (success && !config.random) {
+            const index = config.resources.indexOf(item.resource);
+            if (index !== -1 && index !== config.index) {
+                success(index);
+            }
+        }
+        // Mark as completed and call callbacks
+        status = 'completed';
+        doneCallbacks.forEach((callback) => {
+            callback(data);
+        });
+    }
+    /**
+     * Execute next query
+     */
+    function execNext() {
+        // Check status
+        if (status !== 'pending') {
+            return;
+        }
+        // Reset timer
+        resetTimer();
+        // Get resource
+        const resource = resources.shift();
+        if (resource === void 0) {
+            // Nothing to execute: wait for final timeout before failing
+            if (queue.length) {
+                const timeout = typeof config.timeout === 'function'
+                    ? config.timeout(startTime)
+                    : config.timeout;
+                if (timeout) {
+                    // Last timeout before failing to allow late response
+                    timer = setTimeout(() => {
+                        resetTimer();
+                        if (status === 'pending') {
+                            // Clear queue
+                            clearQueue();
+                            failQuery();
+                        }
+                    }, timeout);
+                    return;
+                }
+            }
+            // Fail
+            failQuery();
+            return;
+        }
+        // Create new item
+        const item = {
+            getQueryStatus,
+            status: 'pending',
+            resource,
+            done: (data, error) => {
+                moduleResponse(item, data, error);
+            },
+        };
+        // Add to queue
+        queue.push(item);
+        // Bump next index
+        queriesSent++;
+        // Get timeout for next item
+        const timeout = typeof config.rotate === 'function'
+            ? config.rotate(queriesSent, startTime)
+            : config.rotate;
+        // Create timer
+        timer = setTimeout(execNext, timeout);
+        // Execute it
+        query(resource, payload, item);
+    }
+    // Execute first query on next tick
+    setTimeout(execNext);
+    // Return getQueryStatus()
+    return getQueryStatus;
+}
+query.sendQuery = sendQuery;
+
+Object.defineProperty(redundancy, "__esModule", { value: true });
+redundancy.initRedundancy = void 0;
+const config_1$2 = config$1;
+const query_1 = query;
+/**
+ * Set configuration
+ */
+function setConfig(config) {
+    if (typeof config !== 'object' ||
+        typeof config.resources !== 'object' ||
+        !(config.resources instanceof Array) ||
+        !config.resources.length) {
+        throw new Error('Invalid Reduncancy configuration');
+    }
+    const newConfig = Object.create(null);
+    let key;
+    for (key in config_1$2.defaultConfig) {
+        if (config[key] !== void 0) {
+            newConfig[key] = config[key];
+        }
+        else {
+            newConfig[key] = config_1$2.defaultConfig[key];
+        }
+    }
+    return newConfig;
+}
+/**
+ * Redundancy instance
+ */
+function initRedundancy(cfg) {
+    // Configuration
+    const config = setConfig(cfg);
+    // List of queries
+    let queries = [];
+    /**
+     * Remove aborted and completed queries
+     */
+    function cleanup() {
+        queries = queries.filter((item) => item().status === 'pending');
+    }
+    /**
+     * Send query
+     */
+    function query(payload, queryCallback, doneCallback) {
+        const query = query_1.sendQuery(config, payload, queryCallback, (data, error) => {
+            // Remove query from list
+            cleanup();
+            // Call callback
+            if (doneCallback) {
+                doneCallback(data, error);
+            }
+        }, (newIndex) => {
+            // Update start index
+            config.index = newIndex;
+        });
+        queries.push(query);
+        return query;
+    }
+    /**
+     * Find instance
+     */
+    function find(callback) {
+        const result = queries.find((value) => {
+            return callback(value);
+        });
+        return result !== void 0 ? result : null;
+    }
+    // Create and return functions
+    const instance = {
+        query,
+        find,
+        setIndex: (index) => {
+            config.index = index;
+        },
+        getIndex: () => config.index,
+        cleanup,
+    };
+    return instance;
+}
+redundancy.initRedundancy = initRedundancy;
+
+var sort = {};
+
+Object.defineProperty(sort, "__esModule", { value: true });
+sort.sortIcons = void 0;
+const storage_1$1 = storage$2;
+/**
+ * Check if icons have been loaded
+ */
+function sortIcons(icons) {
+    const result = {
+        loaded: [],
+        missing: [],
+        pending: [],
+    };
+    const storage = Object.create(null);
+    // Sort icons alphabetically to prevent duplicates and make sure they are sorted in API queries
+    icons.sort((a, b) => {
+        if (a.provider !== b.provider) {
+            return a.provider.localeCompare(b.provider);
+        }
+        if (a.prefix !== b.prefix) {
+            return a.prefix.localeCompare(b.prefix);
+        }
+        return a.name.localeCompare(b.name);
+    });
+    let lastIcon = {
+        provider: '',
+        prefix: '',
+        name: '',
+    };
+    icons.forEach((icon) => {
+        if (lastIcon.name === icon.name &&
+            lastIcon.prefix === icon.prefix &&
+            lastIcon.provider === icon.provider) {
+            return;
+        }
+        lastIcon = icon;
+        // Check icon
+        const provider = icon.provider;
+        const prefix = icon.prefix;
+        const name = icon.name;
+        if (storage[provider] === void 0) {
+            storage[provider] = Object.create(null);
+        }
+        const providerStorage = storage[provider];
+        if (providerStorage[prefix] === void 0) {
+            providerStorage[prefix] = storage_1$1.getStorage(provider, prefix);
+        }
+        const localStorage = providerStorage[prefix];
+        let list;
+        if (localStorage.icons[name] !== void 0) {
+            list = result.loaded;
+        }
+        else if (prefix === '' || localStorage.missing[name] !== void 0) {
+            // Mark icons without prefix as missing because they cannot be loaded from API
+            list = result.missing;
+        }
+        else {
+            list = result.pending;
+        }
+        const item = {
+            provider,
+            prefix,
+            name,
+        };
+        list.push(item);
+    });
+    return result;
+}
+sort.sortIcons = sortIcons;
+
+var callbacks = {};
+
+(function (exports) {
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.storeCallback = exports.updateCallbacks = exports.callbacks = void 0;
+const storage_1 = storage$2;
+// Records sorted by provider and prefix
+// This export is only for unit testing, should not be used
+exports.callbacks = Object.create(null);
+const pendingUpdates = Object.create(null);
+/**
+ * Remove callback
+ */
+function removeCallback(sources, id) {
+    sources.forEach((source) => {
+        const provider = source.provider;
+        if (exports.callbacks[provider] === void 0) {
+            return;
+        }
+        const providerCallbacks = exports.callbacks[provider];
+        const prefix = source.prefix;
+        const items = providerCallbacks[prefix];
+        if (items) {
+            providerCallbacks[prefix] = items.filter((row) => row.id !== id);
+        }
+    });
+}
+/**
+ * Update all callbacks for provider and prefix
+ */
+function updateCallbacks(provider, prefix) {
+    if (pendingUpdates[provider] === void 0) {
+        pendingUpdates[provider] = Object.create(null);
+    }
+    const providerPendingUpdates = pendingUpdates[provider];
+    if (!providerPendingUpdates[prefix]) {
+        providerPendingUpdates[prefix] = true;
+        setTimeout(() => {
+            providerPendingUpdates[prefix] = false;
+            if (exports.callbacks[provider] === void 0 ||
+                exports.callbacks[provider][prefix] === void 0) {
+                return;
+            }
+            // Get all items
+            const items = exports.callbacks[provider][prefix].slice(0);
+            if (!items.length) {
+                return;
+            }
+            const storage = storage_1.getStorage(provider, prefix);
+            // Check each item for changes
+            let hasPending = false;
+            items.forEach((item) => {
+                const icons = item.icons;
+                const oldLength = icons.pending.length;
+                icons.pending = icons.pending.filter((icon) => {
+                    if (icon.prefix !== prefix) {
+                        // Checking only current prefix
+                        return true;
+                    }
+                    const name = icon.name;
+                    if (storage.icons[name] !== void 0) {
+                        // Loaded
+                        icons.loaded.push({
+                            provider,
+                            prefix,
+                            name,
+                        });
+                    }
+                    else if (storage.missing[name] !== void 0) {
+                        // Missing
+                        icons.missing.push({
+                            provider,
+                            prefix,
+                            name,
+                        });
+                    }
+                    else {
+                        // Pending
+                        hasPending = true;
+                        return true;
+                    }
+                    return false;
+                });
+                // Changes detected - call callback
+                if (icons.pending.length !== oldLength) {
+                    if (!hasPending) {
+                        // All icons have been loaded - remove callback from prefix
+                        removeCallback([
+                            {
+                                provider,
+                                prefix,
+                            },
+                        ], item.id);
+                    }
+                    item.callback(icons.loaded.slice(0), icons.missing.slice(0), icons.pending.slice(0), item.abort);
+                }
+            });
+        });
+    }
+}
+exports.updateCallbacks = updateCallbacks;
+/**
+ * Unique id counter for callbacks
+ */
+let idCounter = 0;
+/**
+ * Add callback
+ */
+function storeCallback(callback, icons, pendingSources) {
+    // Create unique id and abort function
+    const id = idCounter++;
+    const abort = removeCallback.bind(null, pendingSources, id);
+    if (!icons.pending.length) {
+        // Do not store item without pending icons and return function that does nothing
+        return abort;
+    }
+    // Create item and store it for all pending prefixes
+    const item = {
+        id,
+        icons,
+        callback,
+        abort: abort,
+    };
+    pendingSources.forEach((source) => {
+        const provider = source.provider;
+        const prefix = source.prefix;
+        if (exports.callbacks[provider] === void 0) {
+            exports.callbacks[provider] = Object.create(null);
+        }
+        const providerCallbacks = exports.callbacks[provider];
+        if (providerCallbacks[prefix] === void 0) {
+            providerCallbacks[prefix] = [];
+        }
+        providerCallbacks[prefix].push(item);
+    });
+    return abort;
+}
+exports.storeCallback = storeCallback;
+}(callbacks));
+
+var modules = {};
+
+Object.defineProperty(modules, "__esModule", { value: true });
+modules.getAPIModule = setAPIModule_1 = modules.setAPIModule = void 0;
+/**
+ * Local storate types and entries
+ */
+const storage = Object.create(null);
+/**
+ * Set API module
+ */
+function setAPIModule(provider, item) {
+    storage[provider] = item;
+}
+var setAPIModule_1 = modules.setAPIModule = setAPIModule;
+/**
+ * Get API module
+ */
+function getAPIModule$3(provider) {
+    return storage[provider] === void 0 ? storage[''] : storage[provider];
+}
+modules.getAPIModule = getAPIModule$3;
+
+var config = {};
+
+Object.defineProperty(config, "__esModule", { value: true });
+var getAPIConfig_1 = config.getAPIConfig = setAPIConfig_1 = config.setAPIConfig = void 0;
+/**
+ * Create full API configuration from partial data
+ */
+function createConfig(source) {
+    let resources;
+    if (typeof source.resources === 'string') {
+        resources = [source.resources];
+    }
+    else {
+        resources = source.resources;
+        if (!(resources instanceof Array) || !resources.length) {
+            return null;
+        }
+    }
+    const result = {
+        // API hosts
+        resources: resources,
+        // Root path
+        path: source.path === void 0 ? '/' : source.path,
+        // URL length limit
+        maxURL: source.maxURL ? source.maxURL : 500,
+        // Timeout before next host is used.
+        rotate: source.rotate ? source.rotate : 750,
+        // Timeout before failing query.
+        timeout: source.timeout ? source.timeout : 5000,
+        // Randomise default API end point.
+        random: source.random === true,
+        // Start index
+        index: source.index ? source.index : 0,
+        // Receive data after time out (used if time out kicks in first, then API module sends data anyway).
+        dataAfterTimeout: source.dataAfterTimeout !== false,
+    };
+    return result;
+}
+/**
+ * Local storage
+ */
+const configStorage = Object.create(null);
+/**
+ * Redundancy for API servers.
+ *
+ * API should have very high uptime because of implemented redundancy at server level, but
+ * sometimes bad things happen. On internet 100% uptime is not possible.
+ *
+ * There could be routing problems. Server might go down for whatever reason, but it takes
+ * few minutes to detect that downtime, so during those few minutes API might not be accessible.
+ *
+ * This script has some redundancy to mitigate possible network issues.
+ *
+ * If one host cannot be reached in 'rotate' (750 by default) ms, script will try to retrieve
+ * data from different host. Hosts have different configurations, pointing to different
+ * API servers hosted at different providers.
+ */
+const fallBackAPISources = [
+    'https://api.simplesvg.com',
+    'https://api.unisvg.com',
+];
+// Shuffle fallback API
+const fallBackAPI = [];
+while (fallBackAPISources.length > 0) {
+    if (fallBackAPISources.length === 1) {
+        fallBackAPI.push(fallBackAPISources.shift());
+    }
+    else {
+        // Get first or last item
+        if (Math.random() > 0.5) {
+            fallBackAPI.push(fallBackAPISources.shift());
+        }
+        else {
+            fallBackAPI.push(fallBackAPISources.pop());
+        }
+    }
+}
+// Add default API
+configStorage[''] = createConfig({
+    resources: ['https://api.iconify.design'].concat(fallBackAPI),
+});
+/**
+ * Add custom config for provider
+ */
+function setAPIConfig(provider, customConfig) {
+    const config = createConfig(customConfig);
+    if (config === null) {
+        return false;
+    }
+    configStorage[provider] = config;
+    return true;
+}
+var setAPIConfig_1 = config.setAPIConfig = setAPIConfig;
+/**
+ * Get API configuration
+ */
+const getAPIConfig = (provider) => configStorage[provider];
+getAPIConfig_1 = config.getAPIConfig = getAPIConfig;
+
+var list = {};
+
+Object.defineProperty(list, "__esModule", { value: true });
+list.getProviders = list.listToIcons = void 0;
+const name_1 = name;
+/**
+ * Convert icons list from string/icon mix to icons and validate them
+ */
+function listToIcons(list, validate = true, simpleNames = false) {
+    const result = [];
+    list.forEach((item) => {
+        const icon = typeof item === 'string'
+            ? name_1.stringToIcon(item, false, simpleNames)
+            : item;
+        if (!validate || name_1.validateIcon(icon, simpleNames)) {
+            result.push({
+                provider: icon.provider,
+                prefix: icon.prefix,
+                name: icon.name,
+            });
+        }
+    });
+    return result;
+}
+list.listToIcons = listToIcons;
+/**
+ * Get all providers
+ */
+function getProviders(list) {
+    const providers = Object.create(null);
+    list.forEach((icon) => {
+        providers[icon.provider] = true;
+    });
+    return Object.keys(providers);
+}
+list.getProviders = getProviders;
+
+Object.defineProperty(api, "__esModule", { value: true });
+var API = api.API = api.getRedundancyCache = void 0;
+const redundancy_1 = redundancy;
+const sort_1 = sort;
+const callbacks_1 = callbacks;
+const modules_1$1 = modules;
+const config_1$1 = config;
+const storage_1 = storage$2;
+const modules_2 = modules$1;
+const list_1 = list;
+const functions_1 = functions$3;
+// Empty abort callback for loadIcons()
+function emptyCallback() {
+    // Do nothing
+}
+const pendingIcons = Object.create(null);
+/**
+ * List of icons that are waiting to be loaded.
+ *
+ * List is passed to API module, then cleared.
+ *
+ * This list should not be used for any checks, use pendingIcons to check
+ * if icons is being loaded.
+ *
+ * [provider][prefix] = array of icon names
+ */
+const iconsToLoad = Object.create(null);
+// Flags to merge multiple synchronous icon requests in one asynchronous request
+const loaderFlags = Object.create(null);
+const queueFlags = Object.create(null);
+const redundancyCache = Object.create(null);
+/**
+ * Get Redundancy instance for provider
+ */
+function getRedundancyCache(provider) {
+    if (redundancyCache[provider] === void 0) {
+        const config = config_1$1.getAPIConfig(provider);
+        if (!config) {
+            // No way to load icons because configuration is not set!
+            return;
+        }
+        const redundancy = redundancy_1.initRedundancy(config);
+        const cachedReundancy = {
+            config,
+            redundancy,
+        };
+        redundancyCache[provider] = cachedReundancy;
+    }
+    return redundancyCache[provider];
+}
+api.getRedundancyCache = getRedundancyCache;
+/**
+ * Function called when new icons have been loaded
+ */
+function loadedNewIcons(provider, prefix) {
+    // Run only once per tick, possibly joining multiple API responses in one call
+    if (loaderFlags[provider] === void 0) {
+        loaderFlags[provider] = Object.create(null);
+    }
+    const providerLoaderFlags = loaderFlags[provider];
+    if (!providerLoaderFlags[prefix]) {
+        providerLoaderFlags[prefix] = true;
+        setTimeout(() => {
+            providerLoaderFlags[prefix] = false;
+            callbacks_1.updateCallbacks(provider, prefix);
+        });
+    }
+}
+// Storage for errors for loadNewIcons(). Used to avoid spamming log with identical errors.
+const errorsCache = Object.create(null);
+/**
+ * Load icons
+ */
+function loadNewIcons(provider, prefix, icons) {
+    function err() {
+        const key = (provider === '' ? '' : '@' + provider + ':') + prefix;
+        const time = Math.floor(Date.now() / 60000); // log once in a minute
+        if (errorsCache[key] < time) {
+            errorsCache[key] = time;
+            console.error('Unable to retrieve icons for "' +
+                key +
+                '" because API is not configured properly.');
+        }
+    }
+    // Create nested objects if needed
+    if (iconsToLoad[provider] === void 0) {
+        iconsToLoad[provider] = Object.create(null);
+    }
+    const providerIconsToLoad = iconsToLoad[provider];
+    if (queueFlags[provider] === void 0) {
+        queueFlags[provider] = Object.create(null);
+    }
+    const providerQueueFlags = queueFlags[provider];
+    if (pendingIcons[provider] === void 0) {
+        pendingIcons[provider] = Object.create(null);
+    }
+    const providerPendingIcons = pendingIcons[provider];
+    // Add icons to queue
+    if (providerIconsToLoad[prefix] === void 0) {
+        providerIconsToLoad[prefix] = icons;
+    }
+    else {
+        providerIconsToLoad[prefix] = providerIconsToLoad[prefix]
+            .concat(icons)
+            .sort();
+    }
+    // Redundancy item
+    let cachedReundancy;
+    // Trigger update on next tick, mering multiple synchronous requests into one asynchronous request
+    if (!providerQueueFlags[prefix]) {
+        providerQueueFlags[prefix] = true;
+        setTimeout(() => {
+            providerQueueFlags[prefix] = false;
+            // Get icons and delete queue
+            const icons = providerIconsToLoad[prefix];
+            delete providerIconsToLoad[prefix];
+            // Get API module
+            const api = modules_1$1.getAPIModule(provider);
+            if (!api) {
+                // No way to load icons!
+                err();
+                return;
+            }
+            // Get API config and Redundancy instance
+            if (cachedReundancy === void 0) {
+                const redundancy = getRedundancyCache(provider);
+                if (redundancy === void 0) {
+                    // No way to load icons because configuration is not set!
+                    err();
+                    return;
+                }
+                cachedReundancy = redundancy;
+            }
+            // Prepare parameters and run queries
+            const params = api.prepare(provider, prefix, icons);
+            params.forEach((item) => {
+                cachedReundancy.redundancy.query(item, api.send, (data, error) => {
+                    const storage = storage_1.getStorage(provider, prefix);
+                    // Check for error
+                    if (typeof data !== 'object') {
+                        if (error !== 404) {
+                            // Do not handle error unless it is 404
+                            return;
+                        }
+                        // Not found: mark as missing
+                        const t = Date.now();
+                        item.icons.forEach((name) => {
+                            storage.missing[name] = t;
+                        });
+                    }
+                    else {
+                        // Add icons to storage
+                        try {
+                            const added = storage_1.addIconSet(storage, data, 'all');
+                            if (typeof added === 'boolean') {
+                                return;
+                            }
+                            // Remove added icons from pending list
+                            const pending = providerPendingIcons[prefix];
+                            added.forEach((name) => {
+                                delete pending[name];
+                            });
+                            // Cache API response
+                            if (modules_2.coreModules.cache) {
+                                modules_2.coreModules.cache(provider, data);
+                            }
+                        }
+                        catch (err) {
+                            console.error(err);
+                        }
+                    }
+                    // Trigger update on next tick
+                    loadedNewIcons(provider, prefix);
+                });
+            });
+        });
+    }
+}
+/**
+ * Check if icon is being loaded
+ */
+const isPending = (icon) => {
+    return (pendingIcons[icon.provider] !== void 0 &&
+        pendingIcons[icon.provider][icon.prefix] !== void 0 &&
+        pendingIcons[icon.provider][icon.prefix][icon.name] !== void 0);
+};
+/**
+ * Load icons
+ */
+const loadIcons$1 = (icons, callback) => {
+    // Clean up and copy icons list
+    const cleanedIcons = list_1.listToIcons(icons, true, functions_1.allowSimpleNames());
+    // Sort icons by missing/loaded/pending
+    // Pending means icon is either being requsted or is about to be requested
+    const sortedIcons = sort_1.sortIcons(cleanedIcons);
+    if (!sortedIcons.pending.length) {
+        // Nothing to load
+        let callCallback = true;
+        if (callback) {
+            setTimeout(() => {
+                if (callCallback) {
+                    callback(sortedIcons.loaded, sortedIcons.missing, sortedIcons.pending, emptyCallback);
+                }
+            });
+        }
+        return () => {
+            callCallback = false;
+        };
+    }
+    // Get all sources for pending icons
+    const newIcons = Object.create(null);
+    const sources = [];
+    let lastProvider, lastPrefix;
+    sortedIcons.pending.forEach((icon) => {
+        const provider = icon.provider;
+        const prefix = icon.prefix;
+        if (prefix === lastPrefix && provider === lastProvider) {
+            return;
+        }
+        lastProvider = provider;
+        lastPrefix = prefix;
+        sources.push({
+            provider,
+            prefix,
+        });
+        if (pendingIcons[provider] === void 0) {
+            pendingIcons[provider] = Object.create(null);
+        }
+        const providerPendingIcons = pendingIcons[provider];
+        if (providerPendingIcons[prefix] === void 0) {
+            providerPendingIcons[prefix] = Object.create(null);
+        }
+        if (newIcons[provider] === void 0) {
+            newIcons[provider] = Object.create(null);
+        }
+        const providerNewIcons = newIcons[provider];
+        if (providerNewIcons[prefix] === void 0) {
+            providerNewIcons[prefix] = [];
+        }
+    });
+    // List of new icons
+    const time = Date.now();
+    // Filter pending icons list: find icons that are not being loaded yet
+    // If icon was called before, it must exist in pendingIcons or storage, but because this
+    // function is called right after sortIcons() that checks storage, icon is definitely not in storage.
+    sortedIcons.pending.forEach((icon) => {
+        const provider = icon.provider;
+        const prefix = icon.prefix;
+        const name = icon.name;
+        const pendingQueue = pendingIcons[provider][prefix];
+        if (pendingQueue[name] === void 0) {
+            // New icon - add to pending queue to mark it as being loaded
+            pendingQueue[name] = time;
+            // Add it to new icons list to pass it to API module for loading
+            newIcons[provider][prefix].push(name);
+        }
+    });
+    // Load icons on next tick to make sure result is not returned before callback is stored and
+    // to consolidate multiple synchronous loadIcons() calls into one asynchronous API call
+    sources.forEach((source) => {
+        const provider = source.provider;
+        const prefix = source.prefix;
+        if (newIcons[provider][prefix].length) {
+            loadNewIcons(provider, prefix, newIcons[provider][prefix]);
+        }
+    });
+    // Store callback and return abort function
+    return callback
+        ? callbacks_1.storeCallback(callback, sortedIcons, sources)
+        : emptyCallback;
+};
+/**
+ * Export module
+ */
+API = api.API = {
+    isPending,
+    loadIcons: loadIcons$1,
+};
+
+var functions$1 = {};
+
+Object.defineProperty(functions$1, "__esModule", { value: true });
+var APIInternalFunctions = functions$1.APIInternalFunctions = APIFunctions = functions$1.APIFunctions = void 0;
+const _1 = api;
+const config_1 = config;
+const modules_1 = modules;
+var APIFunctions = functions$1.APIFunctions = {
+    loadIcons: _1.API.loadIcons,
+    addAPIProvider: config_1.setAPIConfig,
+};
+APIInternalFunctions = functions$1.APIInternalFunctions = {
+    getAPI: _1.getRedundancyCache,
+    getAPIConfig: config_1.getAPIConfig,
+    setAPIModule: modules_1.setAPIModule,
+};
+
+var jsonp = {};
+
+Object.defineProperty(jsonp, "__esModule", { value: true });
+var getAPIModule_1$1 = jsonp.getAPIModule = void 0;
+let rootVar = null;
+/**
+ * Endpoint
+ */
+let endPoint$1 = '{prefix}.js?icons={icons}&callback={callback}';
+/**
+ * Cache: provider:prefix = value
+ */
+const maxLengthCache$1 = Object.create(null);
+const pathCache$1 = Object.create(null);
+/**
+ * Get hash for query
+ *
+ * Hash is used in JSONP callback name, so same queries end up with same JSONP callback,
+ * allowing response to be cached in browser.
+ */
+function hash(str) {
+    let total = 0, i;
+    for (i = str.length - 1; i >= 0; i--) {
+        total += str.charCodeAt(i);
+    }
+    return total % 999;
+}
+/**
+ * Get root object
+ */
+function getGlobal() {
+    // Create root
+    if (rootVar === null) {
+        // window
+        const globalRoot = self;
+        // Test for window.Iconify. If missing, create 'IconifyJSONP'
+        let prefix = 'Iconify';
+        let extraPrefix = '.cb';
+        if (globalRoot[prefix] === void 0) {
+            // Use 'IconifyJSONP' global
+            prefix = 'IconifyJSONP';
+            extraPrefix = '';
+            if (globalRoot[prefix] === void 0) {
+                globalRoot[prefix] = Object.create(null);
+            }
+            rootVar = globalRoot[prefix];
+        }
+        else {
+            // Use 'Iconify.cb'
+            const iconifyRoot = globalRoot[prefix];
+            if (iconifyRoot.cb === void 0) {
+                iconifyRoot.cb = Object.create(null);
+            }
+            rootVar = iconifyRoot.cb;
+        }
+        // Change end point
+        endPoint$1 = endPoint$1.replace('{callback}', prefix + extraPrefix + '.{cb}');
+    }
+    return rootVar;
+}
+/**
+ * Return API module
+ */
+const getAPIModule$2 = (getAPIConfig) => {
+    /**
+     * Calculate maximum icons list length for prefix
+     */
+    function calculateMaxLength(provider, prefix) {
+        // Get config and store path
+        const config = getAPIConfig(provider);
+        if (!config) {
+            return 0;
+        }
+        // Calculate
+        let result;
+        if (!config.maxURL) {
+            result = 0;
+        }
+        else {
+            let maxHostLength = 0;
+            config.resources.forEach((item) => {
+                const host = item;
+                maxHostLength = Math.max(maxHostLength, host.length);
+            });
+            // Make sure global is set
+            getGlobal();
+            // Extra width: prefix (3) + counter (4) - '{cb}' (4)
+            const extraLength = 3;
+            // Get available length
+            result =
+                config.maxURL -
+                    maxHostLength -
+                    config.path.length -
+                    endPoint$1
+                        .replace('{provider}', provider)
+                        .replace('{prefix}', prefix)
+                        .replace('{icons}', '').length -
+                    extraLength;
+        }
+        // Cache stuff and return result
+        const cacheKey = provider + ':' + prefix;
+        pathCache$1[cacheKey] = config.path;
+        maxLengthCache$1[cacheKey] = result;
+        return result;
+    }
+    /**
+     * Prepare params
+     */
+    const prepare = (provider, prefix, icons) => {
+        const results = [];
+        // Get maximum icons list length
+        const cacheKey = provider + ':' + prefix;
+        let maxLength = maxLengthCache$1[cacheKey];
+        if (maxLength === void 0) {
+            maxLength = calculateMaxLength(provider, prefix);
+        }
+        // Split icons
+        let item = {
+            provider,
+            prefix,
+            icons: [],
+        };
+        let length = 0;
+        icons.forEach((name, index) => {
+            length += name.length + 1;
+            if (length >= maxLength && index > 0) {
+                // Next set
+                results.push(item);
+                item = {
+                    provider,
+                    prefix,
+                    icons: [],
+                };
+                length = name.length;
+            }
+            item.icons.push(name);
+        });
+        results.push(item);
+        return results;
+    };
+    /**
+     * Load icons
+     */
+    const send = (host, params, status) => {
+        const provider = params.provider;
+        const prefix = params.prefix;
+        const icons = params.icons;
+        const iconsList = icons.join(',');
+        const cacheKey = provider + ':' + prefix;
+        // Create callback prefix
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        const cbPrefix = prefix.split('-').shift().slice(0, 3);
+        const global = getGlobal();
+        // Callback hash
+        let cbCounter = hash(provider + ':' + host + ':' + prefix + ':' + iconsList);
+        while (global[cbPrefix + cbCounter] !== void 0) {
+            cbCounter++;
+        }
+        const callbackName = cbPrefix + cbCounter;
+        const path = pathCache$1[cacheKey] +
+            endPoint$1
+                .replace('{provider}', provider)
+                .replace('{prefix}', prefix)
+                .replace('{icons}', iconsList)
+                .replace('{cb}', callbackName);
+        global[callbackName] = (data) => {
+            // Remove callback and complete query
+            delete global[callbackName];
+            status.done(data);
+        };
+        // Create URI
+        const uri = host + path;
+        // console.log('API query:', uri);
+        // Create script and append it to head
+        const script = document.createElement('script');
+        script.type = 'text/javascript';
+        script.async = true;
+        script.src = uri;
+        document.head.appendChild(script);
+    };
+    // Return functions
+    return {
+        prepare,
+        send,
+    };
+};
+getAPIModule_1$1 = jsonp.getAPIModule = getAPIModule$2;
+
+var fetch$1 = {};
+
+Object.defineProperty(fetch$1, "__esModule", { value: true });
+var getAPIModule_1 = fetch$1.getAPIModule = setFetch_1 = fetch$1.setFetch = void 0;
+/**
+ * Endpoint
+ */
+const endPoint = '{prefix}.json?icons={icons}';
+/**
+ * Cache
+ */
+const maxLengthCache = Object.create(null);
+const pathCache = Object.create(null);
+/**
+ * Fetch function
+ *
+ * Use this to set 'cross-fetch' in node.js environment if you are retrieving icons on server side.
+ * Not needed when using stuff like Next.js or SvelteKit because components use API only on client side.
+ */
+let fetchModule = null;
+try {
+    fetchModule = fetch;
+}
+catch (err) {
+    //
+}
+function setFetch(fetch) {
+    fetchModule = fetch;
+}
+var setFetch_1 = fetch$1.setFetch = setFetch;
+/**
+ * Return API module
+ */
+const getAPIModule$1 = (getAPIConfig) => {
+    /**
+     * Calculate maximum icons list length for prefix
+     */
+    function calculateMaxLength(provider, prefix) {
+        // Get config and store path
+        const config = getAPIConfig(provider);
+        if (!config) {
+            return 0;
+        }
+        // Calculate
+        let result;
+        if (!config.maxURL) {
+            result = 0;
+        }
+        else {
+            let maxHostLength = 0;
+            config.resources.forEach((item) => {
+                const host = item;
+                maxHostLength = Math.max(maxHostLength, host.length);
+            });
+            // Get available length
+            result =
+                config.maxURL -
+                    maxHostLength -
+                    config.path.length -
+                    endPoint
+                        .replace('{provider}', provider)
+                        .replace('{prefix}', prefix)
+                        .replace('{icons}', '').length;
+        }
+        // Cache stuff and return result
+        const cacheKey = provider + ':' + prefix;
+        pathCache[cacheKey] = config.path;
+        maxLengthCache[cacheKey] = result;
+        return result;
+    }
+    /**
+     * Prepare params
+     */
+    const prepare = (provider, prefix, icons) => {
+        const results = [];
+        // Get maximum icons list length
+        let maxLength = maxLengthCache[prefix];
+        if (maxLength === void 0) {
+            maxLength = calculateMaxLength(provider, prefix);
+        }
+        // Split icons
+        let item = {
+            provider,
+            prefix,
+            icons: [],
+        };
+        let length = 0;
+        icons.forEach((name, index) => {
+            length += name.length + 1;
+            if (length >= maxLength && index > 0) {
+                // Next set
+                results.push(item);
+                item = {
+                    provider,
+                    prefix,
+                    icons: [],
+                };
+                length = name.length;
+            }
+            item.icons.push(name);
+        });
+        results.push(item);
+        return results;
+    };
+    /**
+     * Load icons
+     */
+    const send = (host, params, status) => {
+        const provider = params.provider;
+        const prefix = params.prefix;
+        const icons = params.icons;
+        const iconsList = icons.join(',');
+        const cacheKey = provider + ':' + prefix;
+        const path = pathCache[cacheKey] +
+            endPoint
+                .replace('{provider}', provider)
+                .replace('{prefix}', prefix)
+                .replace('{icons}', iconsList);
+        if (!fetchModule) {
+            // Fail: return 424 Failed Dependency (its not meant to be used like that, but it is the best match)
+            status.done(void 0, 424);
+            return;
+        }
+        // console.log('API query:', host + path);
+        fetchModule(host + path)
+            .then((response) => {
+            if (response.status !== 200) {
+                status.done(void 0, response.status);
+                return;
+            }
+            return response.json();
+        })
+            .then((data) => {
+            if (typeof data !== 'object' || data === null) {
+                return;
+            }
+            // Store cache and complete
+            status.done(data);
+        })
+            .catch((err) => {
+            // Error
+            status.done(void 0, err.errno);
+        });
+    };
+    // Return functions
+    return {
+        prepare,
+        send,
+    };
+};
+getAPIModule_1 = fetch$1.getAPIModule = getAPIModule$1;
+
+var browserStorage = {};
+
+(function (exports) {
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.storeCache = exports.loadCache = exports.mock = exports.emptyList = exports.count = exports.config = void 0;
+const storage_1 = storage$2;
+// After changing configuration change it in tests/*/fake_cache.ts
+// Cache version. Bump when structure changes
+const cacheVersion = 'iconify2';
+// Cache keys
+const cachePrefix = 'iconify';
+const countKey = cachePrefix + '-count';
+const versionKey = cachePrefix + '-version';
+/**
+ * Cache expiration
+ */
+const hour = 3600000;
+const cacheExpiration = 168; // In hours
+/**
+ * Storage configuration
+ */
+exports.config = {
+    local: true,
+    session: true,
+};
+/**
+ * Flag to check if storage has been loaded
+ */
+let loaded = false;
+/**
+ * Items counter
+ */
+exports.count = {
+    local: 0,
+    session: 0,
+};
+/**
+ * List of empty items
+ */
+exports.emptyList = {
+    local: [],
+    session: [],
+};
+let _window = typeof window === 'undefined' ? {} : window;
+function mock(fakeWindow) {
+    loaded = false;
+    _window = fakeWindow;
+}
+exports.mock = mock;
+/**
+ * Get global
+ *
+ * @param key
+ */
+function getGlobal(key) {
+    const attr = key + 'Storage';
+    try {
+        if (_window &&
+            _window[attr] &&
+            typeof _window[attr].length === 'number') {
+            return _window[attr];
+        }
+    }
+    catch (err) {
+        //
+    }
+    // Failed - mark as disabled
+    exports.config[key] = false;
+    return null;
+}
+/**
+ * Change current count for storage
+ */
+function setCount(storage, key, value) {
+    try {
+        storage.setItem(countKey, value + '');
+        exports.count[key] = value;
+        return true;
+    }
+    catch (err) {
+        return false;
+    }
+}
+/**
+ * Get current count from storage
+ *
+ * @param storage
+ */
+function getCount(storage) {
+    const count = storage.getItem(countKey);
+    if (count) {
+        const total = parseInt(count);
+        return total ? total : 0;
+    }
+    return 0;
+}
+/**
+ * Initialize storage
+ *
+ * @param storage
+ * @param key
+ */
+function initCache(storage, key) {
+    try {
+        storage.setItem(versionKey, cacheVersion);
+    }
+    catch (err) {
+        //
+    }
+    setCount(storage, key, 0);
+}
+/**
+ * Destroy old cache
+ *
+ * @param storage
+ */
+function destroyCache(storage) {
+    try {
+        const total = getCount(storage);
+        for (let i = 0; i < total; i++) {
+            storage.removeItem(cachePrefix + i);
+        }
+    }
+    catch (err) {
+        //
+    }
+}
+/**
+ * Load icons from cache
+ */
+const loadCache = () => {
+    if (loaded) {
+        return;
+    }
+    loaded = true;
+    // Minimum time
+    const minTime = Math.floor(Date.now() / hour) - cacheExpiration;
+    // Load data from storage
+    function load(key) {
+        const func = getGlobal(key);
+        if (!func) {
+            return;
+        }
+        // Get one item from storage
+        const getItem = (index) => {
+            const name = cachePrefix + index;
+            const item = func.getItem(name);
+            if (typeof item !== 'string') {
+                // Does not exist
+                return false;
+            }
+            // Get item, validate it
+            let valid = true;
+            try {
+                // Parse, check time stamp
+                const data = JSON.parse(item);
+                if (typeof data !== 'object' ||
+                    typeof data.cached !== 'number' ||
+                    data.cached < minTime ||
+                    typeof data.provider !== 'string' ||
+                    typeof data.data !== 'object' ||
+                    typeof data.data.prefix !== 'string') {
+                    valid = false;
+                }
+                else {
+                    // Add icon set
+                    const provider = data.provider;
+                    const prefix = data.data.prefix;
+                    const storage = storage_1.getStorage(provider, prefix);
+                    valid = storage_1.addIconSet(storage, data.data);
+                }
+            }
+            catch (err) {
+                valid = false;
+            }
+            if (!valid) {
+                func.removeItem(name);
+            }
+            return valid;
+        };
+        try {
+            // Get version
+            const version = func.getItem(versionKey);
+            if (version !== cacheVersion) {
+                if (version) {
+                    // Version is set, but invalid - remove old entries
+                    destroyCache(func);
+                }
+                // Empty data
+                initCache(func, key);
+                return;
+            }
+            // Get number of stored items
+            let total = getCount(func);
+            for (let i = total - 1; i >= 0; i--) {
+                if (!getItem(i)) {
+                    // Remove item
+                    if (i === total - 1) {
+                        // Last item - reduce country
+                        total--;
+                    }
+                    else {
+                        // Mark as empty
+                        exports.emptyList[key].push(i);
+                    }
+                }
+            }
+            // Update total
+            setCount(func, key, total);
+        }
+        catch (err) {
+            //
+        }
+    }
+    for (const key in exports.config) {
+        load(key);
+    }
+};
+exports.loadCache = loadCache;
+/**
+ * Function to cache icons
+ */
+const storeCache = (provider, data) => {
+    if (!loaded) {
+        exports.loadCache();
+    }
+    function store(key) {
+        if (!exports.config[key]) {
+            return false;
+        }
+        const func = getGlobal(key);
+        if (!func) {
+            return false;
+        }
+        // Get item index
+        let index = exports.emptyList[key].shift();
+        if (index === void 0) {
+            // Create new index
+            index = exports.count[key];
+            if (!setCount(func, key, index + 1)) {
+                return false;
+            }
+        }
+        // Create and save item
+        try {
+            const item = {
+                cached: Math.floor(Date.now() / hour),
+                provider,
+                data,
+            };
+            func.setItem(cachePrefix + index, JSON.stringify(item));
+        }
+        catch (err) {
+            return false;
+        }
+        return true;
+    }
+    // Attempt to store at localStorage first, then at sessionStorage
+    if (!store('local')) {
+        store('session');
+    }
+};
+exports.storeCache = storeCache;
+}(browserStorage));
+
+var functions = {};
+
+Object.defineProperty(functions, "__esModule", { value: true });
+var toggleBrowserCache_1 = functions.toggleBrowserCache = void 0;
+const index_1 = browserStorage;
+/**
+ * Toggle cache
+ */
+function toggleBrowserCache(storage, value) {
+    switch (storage) {
+        case 'local':
+        case 'session':
+            index_1.config[storage] = value;
+            break;
+        case 'all':
+            for (const key in index_1.config) {
+                index_1.config[key] = value;
+            }
+            break;
+    }
+}
+toggleBrowserCache_1 = functions.toggleBrowserCache = toggleBrowserCache;
+
+var shorthand = {};
+
+Object.defineProperty(shorthand, "__esModule", { value: true });
+var alignmentFromString_1 = shorthand.alignmentFromString = flipFromString_1 = shorthand.flipFromString = void 0;
+const separator = /[\s,]+/;
+/**
+ * Apply "flip" string to icon customisations
+ */
+function flipFromString(custom, flip) {
+    flip.split(separator).forEach((str) => {
+        const value = str.trim();
+        switch (value) {
+            case 'horizontal':
+                custom.hFlip = true;
+                break;
+            case 'vertical':
+                custom.vFlip = true;
+                break;
+        }
+    });
+}
+var flipFromString_1 = shorthand.flipFromString = flipFromString;
+/**
+ * Apply "align" string to icon customisations
+ */
+function alignmentFromString(custom, align) {
+    align.split(separator).forEach((str) => {
+        const value = str.trim();
+        switch (value) {
+            case 'left':
+            case 'center':
+            case 'right':
+                custom.hAlign = value;
+                break;
+            case 'top':
+            case 'middle':
+            case 'bottom':
+                custom.vAlign = value;
+                break;
+            case 'slice':
+            case 'crop':
+                custom.slice = true;
+                break;
+            case 'meet':
+                custom.slice = false;
+        }
+    });
+}
+alignmentFromString_1 = shorthand.alignmentFromString = alignmentFromString;
+
+var rotate = {};
+
+Object.defineProperty(rotate, "__esModule", { value: true });
+var rotateFromString_1 = rotate.rotateFromString = void 0;
+/**
+ * Get rotation value
+ */
+function rotateFromString(value) {
+    const units = value.replace(/^-?[0-9.]*/, '');
+    function cleanup(value) {
+        while (value < 0) {
+            value += 4;
+        }
+        return value % 4;
+    }
+    if (units === '') {
+        const num = parseInt(value);
+        return isNaN(num) ? 0 : cleanup(num);
+    }
+    else if (units !== value) {
+        let split = 0;
+        switch (units) {
+            case '%':
+                // 25% -> 1, 50% -> 2, ...
+                split = 25;
+                break;
+            case 'deg':
+                // 90deg -> 1, 180deg -> 2, ...
+                split = 90;
+        }
+        if (split) {
+            let num = parseFloat(value.slice(0, value.length - units.length));
+            if (isNaN(num)) {
+                return 0;
+            }
+            num = num / split;
+            return num % 1 === 0 ? cleanup(num) : 0;
+        }
+    }
+    return 0;
+}
+rotateFromString_1 = rotate.rotateFromString = rotateFromString;
+
+/**
+ * Default SVG attributes
+ */
+const svgDefaults = {
+    'xmlns': 'http://www.w3.org/2000/svg',
+    'xmlns:xlink': 'http://www.w3.org/1999/xlink',
+    'aria-hidden': true,
+    'role': 'img',
+};
+/**
+ * Aliases for customisations.
+ * In Vue 'v-' properties are reserved, so v-align and v-flip must be renamed
+ */
+let customisationAliases = {};
+['horizontal', 'vertical'].forEach(prefix => {
+    ['Align', 'Flip'].forEach(suffix => {
+        const attr = prefix.slice(0, 1) + suffix;
+        const value = {
+            attr,
+            boolean: suffix === 'Flip',
+        };
+        // vertical-align
+        customisationAliases[prefix + '-' + suffix.toLowerCase()] = value;
+        // v-align
+        customisationAliases[prefix.slice(0, 1) + '-' + suffix.toLowerCase()] = value;
+        // verticalAlign
+        customisationAliases[prefix + suffix] = value;
+    });
+});
+/**
+ * Render icon
+ */
+const render = (
+// Icon must be validated before calling this function
+icon, 
+// Partial properties
+props) => {
+    // Split properties
+    const customisations = mergeCustomisations_1(defaults, props);
+    const componentProps = { ...svgDefaults };
+    // Copy style
+    let style = typeof props.style === 'object' && !(props.style instanceof Array)
+        ? { ...props.style }
+        : {};
+    // Get element properties
+    for (let key in props) {
+        const value = props[key];
+        if (value === void 0) {
+            continue;
+        }
+        switch (key) {
+            // Properties to ignore
+            case 'icon':
+            case 'style':
+            case 'onLoad':
+                break;
+            // Boolean attributes
+            case 'inline':
+            case 'hFlip':
+            case 'vFlip':
+                customisations[key] =
+                    value === true || value === 'true' || value === 1;
+                break;
+            // Flip as string: 'horizontal,vertical'
+            case 'flip':
+                if (typeof value === 'string') {
+                    flipFromString_1(customisations, value);
+                }
+                break;
+            // Alignment as string
+            case 'align':
+                if (typeof value === 'string') {
+                    alignmentFromString_1(customisations, value);
+                }
+                break;
+            // Color: override style
+            case 'color':
+                style.color = value;
+                break;
+            // Rotation as string
+            case 'rotate':
+                if (typeof value === 'string') {
+                    customisations[key] = rotateFromString_1(value);
+                }
+                else if (typeof value === 'number') {
+                    customisations[key] = value;
+                }
+                break;
+            // Remove aria-hidden
+            case 'ariaHidden':
+            case 'aria-hidden':
+                // Vue transforms 'aria-hidden' property to 'ariaHidden'
+                if (value !== true && value !== 'true') {
+                    delete componentProps['aria-hidden'];
+                }
+                break;
+            default:
+                if (customisationAliases[key] !== void 0) {
+                    // Aliases for customisations
+                    if (customisationAliases[key].boolean &&
+                        (value === true || value === 'true' || value === 1)) {
+                        // Check for boolean
+                        customisations[customisationAliases[key].attr] = true;
+                    }
+                    else if (!customisationAliases[key].boolean &&
+                        typeof value === 'string' &&
+                        value !== '') {
+                        // String
+                        customisations[customisationAliases[key].attr] = value;
+                    }
+                }
+                else if (defaults[key] === void 0) {
+                    // Copy missing property if it does not exist in customisations
+                    componentProps[key] = value;
+                }
+        }
+    }
+    // Generate icon
+    const item = iconToSVG_1(icon, customisations);
+    // Add icon stuff
+    for (let key in item.attributes) {
+        componentProps[key] = item.attributes[key];
+    }
+    if (item.inline &&
+        style.verticalAlign === void 0 &&
+        style['vertical-align'] === void 0) {
+        style.verticalAlign = '-0.125em';
+    }
+    // Counter for ids based on "id" property to render icons consistently on server and client
+    let localCounter = 0;
+    const id = props.id;
+    // Add innerHTML and style to props
+    componentProps['innerHTML'] = replaceIDs_1(item.body, id ? () => id + '-' + localCounter++ : 'iconify-vue-');
+    if (Object.keys(style).length > 0) {
+        componentProps['style'] = style;
+    }
+    // Render icon
+    return (0,vue__WEBPACK_IMPORTED_MODULE_0__.h)('svg', componentProps);
+};
+
+/**
+ * Enable and disable browser cache
+ */
+const enableCache = (storage) => toggleBrowserCache_1(storage, true);
+const disableCache = (storage) => toggleBrowserCache_1(storage, false);
+/* Storage functions */
+/**
+ * Check if icon exists
+ */
+const iconExists = storageFunctions.iconExists;
+/**
+ * Get icon data
+ */
+const getIcon = storageFunctions.getIcon;
+/**
+ * List available icons
+ */
+const listIcons = storageFunctions.listIcons;
+/**
+ * Add one icon
+ */
+const addIcon = storageFunctions.addIcon;
+/**
+ * Add icon set
+ */
+const addCollection = storageFunctions.addCollection;
+/* Builder functions */
+/**
+ * Calculate icon size
+ */
+const calculateSize = builderFunctions.calculateSize;
+/**
+ * Replace unique ids in content
+ */
+const replaceIDs = builderFunctions.replaceIDs;
+/**
+ * Build SVG
+ */
+const buildIcon = builderFunctions.buildIcon;
+/* API functions */
+/**
+ * Load icons
+ */
+const loadIcons = APIFunctions.loadIcons;
+/**
+ * Add API provider
+ */
+const addAPIProvider = APIFunctions.addAPIProvider;
+/**
+ * Export internal functions that can be used by third party implementations
+ */
+const _api = APIInternalFunctions;
+/**
+ * Initialise stuff
+ */
+// Enable short names
+allowSimpleNames_1(true);
+// Set API
+coreModules.api = API;
+// Use Fetch API by default
+let getAPIModule = getAPIModule_1;
+try {
+    if (typeof document !== 'undefined' && typeof window !== 'undefined') {
+        // If window and document exist, attempt to load whatever module is available, otherwise use Fetch API
+        getAPIModule =
+            typeof fetch === 'function' && typeof Promise === 'function'
+                ? getAPIModule_1
+                : getAPIModule_1$1;
+    }
+}
+catch (err) {
+    //
+}
+setAPIModule_1('', getAPIModule(getAPIConfig_1));
+/**
+ * Function to enable node-fetch for getting icons on server side
+ */
+_api.setFetch = (nodeFetch) => {
+    setFetch_1(nodeFetch);
+    if (getAPIModule !== getAPIModule_1) {
+        getAPIModule = getAPIModule_1;
+        setAPIModule_1('', getAPIModule(getAPIConfig_1));
+    }
+};
+/**
+ * Browser stuff
+ */
+if (typeof document !== 'undefined' && typeof window !== 'undefined') {
+    // Set cache and load existing cache
+    coreModules.cache = browserStorage.storeCache;
+    browserStorage.loadCache();
+    const _window = window;
+    // Load icons from global "IconifyPreload"
+    if (_window.IconifyPreload !== void 0) {
+        const preload = _window.IconifyPreload;
+        const err = 'Invalid IconifyPreload syntax.';
+        if (typeof preload === 'object' && preload !== null) {
+            (preload instanceof Array ? preload : [preload]).forEach(item => {
+                try {
+                    if (
+                    // Check if item is an object and not null/array
+                    typeof item !== 'object' ||
+                        item === null ||
+                        item instanceof Array ||
+                        // Check for 'icons' and 'prefix'
+                        typeof item.icons !== 'object' ||
+                        typeof item.prefix !== 'string' ||
+                        // Add icon set
+                        !addCollection(item)) {
+                        console.error(err);
+                    }
+                }
+                catch (e) {
+                    console.error(err);
+                }
+            });
+        }
+    }
+    // Set API from global "IconifyProviders"
+    if (_window.IconifyProviders !== void 0) {
+        const providers = _window.IconifyProviders;
+        if (typeof providers === 'object' && providers !== null) {
+            for (let key in providers) {
+                const err = 'IconifyProviders[' + key + '] is invalid.';
+                try {
+                    const value = providers[key];
+                    if (typeof value !== 'object' ||
+                        !value ||
+                        value.resources === void 0) {
+                        continue;
+                    }
+                    if (!setAPIConfig_1(key, value)) {
+                        console.error(err);
+                    }
+                }
+                catch (e) {
+                    console.error(err);
+                }
+            }
+        }
+    }
+}
+const Icon = (0,vue__WEBPACK_IMPORTED_MODULE_0__.defineComponent)({
+    // Do not inherit other attributes: it is handled by render()
+    inheritAttrs: false,
+    // Set initial data
+    data() {
+        return {
+            // Mounted status
+            mounted: false,
+            // Callback counter to trigger re-render
+            counter: 0,
+        };
+    },
+    beforeMount() {
+        // Current icon name
+        this._name = '';
+        // Loading
+        this._loadingIcon = null;
+        // Mark as mounted
+        this.mounted = true;
+    },
+    unmounted() {
+        this.abortLoading();
+    },
+    methods: {
+        abortLoading() {
+            if (this._loadingIcon) {
+                this._loadingIcon.abort();
+                this._loadingIcon = null;
+            }
+        },
+        // Get data for icon to render or null
+        getIcon(icon$1, onload) {
+            // Icon is an object
+            if (typeof icon$1 === 'object' &&
+                icon$1 !== null &&
+                typeof icon$1.body === 'string') {
+                // Stop loading
+                this._name = '';
+                this.abortLoading();
+                return {
+                    data: icon.fullIcon(icon$1),
+                };
+            }
+            // Invalid icon?
+            let iconName;
+            if (typeof icon$1 !== 'string' ||
+                (iconName = name.stringToIcon(icon$1, false, true)) === null) {
+                this.abortLoading();
+                return null;
+            }
+            // Load icon
+            const data = getIconData_1(iconName);
+            if (data === null) {
+                // Icon needs to be loaded
+                if (!this._loadingIcon || this._loadingIcon.name !== icon$1) {
+                    // New icon to load
+                    this.abortLoading();
+                    this._name = '';
+                    this._loadingIcon = {
+                        name: icon$1,
+                        abort: API.loadIcons([iconName], () => {
+                            this.counter++;
+                        }),
+                    };
+                }
+                return null;
+            }
+            // Icon data is available
+            this.abortLoading();
+            if (this._name !== icon$1) {
+                this._name = icon$1;
+                if (onload) {
+                    onload(icon$1);
+                }
+            }
+            // Add classes
+            const classes = ['iconify'];
+            if (iconName.prefix !== '') {
+                classes.push('iconify--' + iconName.prefix);
+            }
+            if (iconName.provider !== '') {
+                classes.push('iconify--' + iconName.provider);
+            }
+            return { data, classes };
+        },
+    },
+    // Render icon
+    render() {
+        if (!this.mounted) {
+            return this.$slots.default ? this.$slots.default() : null;
+        }
+        // Re-render when counter changes
+        this.counter;
+        // Get icon data
+        const props = this.$attrs;
+        const icon = this.getIcon(props.icon, props.onLoad);
+        // Validate icon object
+        if (!icon) {
+            return this.$slots.default ? this.$slots.default() : null;
+        }
+        // Add classes
+        let newProps = props;
+        if (icon.classes) {
+            newProps = {
+                ...props,
+                class: (typeof props['class'] === 'string'
+                    ? props['class'] + ' '
+                    : '') + icon.classes.join(' '),
+            };
+        }
+        // Render icon
+        return render(icon.data, newProps);
+    },
+});
+
+
+
+
+/***/ }),
+
+/***/ "./node_modules/axios/package.json":
+/*!*****************************************!*\
+  !*** ./node_modules/axios/package.json ***!
+  \*****************************************/
+/***/ ((module) => {
+
+"use strict";
+module.exports = JSON.parse('{"_from":"axios@0.21.4","_id":"axios@0.21.4","_inBundle":false,"_integrity":"sha512-ut5vewkiu8jjGBdqpM44XxjuCjq9LAKeHVmoVfHVzy8eHgxxq8SbAVQNovDA8mVi05kP0Ea/n/UzcSHcTJQfNg==","_location":"/axios","_phantomChildren":{},"_requested":{"type":"version","registry":true,"raw":"axios@0.21.4","name":"axios","escapedName":"axios","rawSpec":"0.21.4","saveSpec":null,"fetchSpec":"0.21.4"},"_requiredBy":["#DEV:/","#USER","/@inertiajs/inertia"],"_resolved":"https://registry.npmjs.org/axios/-/axios-0.21.4.tgz","_shasum":"c67b90dc0568e5c1cf2b0b858c43ba28e2eda575","_spec":"axios@0.21.4","_where":"C:\\\\xampp\\\\htdocs\\\\Heroi_Solidario","author":{"name":"Matt Zabriskie"},"browser":{"./lib/adapters/http.js":"./lib/adapters/xhr.js"},"bugs":{"url":"https://github.com/axios/axios/issues"},"bundleDependencies":false,"bundlesize":[{"path":"./dist/axios.min.js","threshold":"5kB"}],"dependencies":{"follow-redirects":"^1.14.0"},"deprecated":false,"description":"Promise based HTTP client for the browser and node.js","devDependencies":{"coveralls":"^3.0.0","es6-promise":"^4.2.4","grunt":"^1.3.0","grunt-banner":"^0.6.0","grunt-cli":"^1.2.0","grunt-contrib-clean":"^1.1.0","grunt-contrib-watch":"^1.0.0","grunt-eslint":"^23.0.0","grunt-karma":"^4.0.0","grunt-mocha-test":"^0.13.3","grunt-ts":"^6.0.0-beta.19","grunt-webpack":"^4.0.2","istanbul-instrumenter-loader":"^1.0.0","jasmine-core":"^2.4.1","karma":"^6.3.2","karma-chrome-launcher":"^3.1.0","karma-firefox-launcher":"^2.1.0","karma-jasmine":"^1.1.1","karma-jasmine-ajax":"^0.1.13","karma-safari-launcher":"^1.0.0","karma-sauce-launcher":"^4.3.6","karma-sinon":"^1.0.5","karma-sourcemap-loader":"^0.3.8","karma-webpack":"^4.0.2","load-grunt-tasks":"^3.5.2","minimist":"^1.2.0","mocha":"^8.2.1","sinon":"^4.5.0","terser-webpack-plugin":"^4.2.3","typescript":"^4.0.5","url-search-params":"^0.10.0","webpack":"^4.44.2","webpack-dev-server":"^3.11.0"},"homepage":"https://axios-http.com","jsdelivr":"dist/axios.min.js","keywords":["xhr","http","ajax","promise","node"],"license":"MIT","main":"index.js","name":"axios","repository":{"type":"git","url":"git+https://github.com/axios/axios.git"},"scripts":{"build":"NODE_ENV=production grunt build","coveralls":"cat coverage/lcov.info | ./node_modules/coveralls/bin/coveralls.js","examples":"node ./examples/server.js","fix":"eslint --fix lib/**/*.js","postversion":"git push && git push --tags","preversion":"npm test","start":"node ./sandbox/server.js","test":"grunt test","version":"npm run build && grunt version && git add -A dist && git add CHANGELOG.md bower.json package.json"},"typings":"./index.d.ts","unpkg":"dist/axios.min.js","version":"0.21.4"}');
 
 /***/ })
 
