@@ -1,8 +1,8 @@
 <template>
-    <app-layout title="Quero Doar">
+    <app-layout title="Editar Doacao">
         <template #header>
             <h2 class="font-semibold text-xl text-gray-800 leading-tight">
-                    Quero Doar
+                    Editar Doação
             </h2>
         </template>     
 

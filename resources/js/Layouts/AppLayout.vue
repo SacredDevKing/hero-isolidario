@@ -135,14 +135,16 @@
                                         <!-- Authentication -->
                                         <form @submit.prevent="logout">
                                             <jet-dropdown-link as="button">
-                                                Log Out
+                                                Sair
                                             </jet-dropdown-link>
                                         </form>
                                     </template>
                                 </jet-dropdown>
                             </div>
 
-                            <jet-button class="ml-4 rounded-full" :href="route('quero-doar')">Quero Doar</jet-button>
+                            <Link :href="route('quero-doar')">
+                                <jet-button class="ml-4 rounded-full" :href="route('quero-doar')">Quero Doar</jet-button>
+                            </Link>
                         </div>
 
                         <!-- Hamburger -->
@@ -243,9 +245,57 @@
             </header> -->
 
             <!-- Page Content -->
-            <main>
+            <main id="app">
                 <slot></slot>
             </main>
+
+            <div class="w-full min-h-screen flex items-center justify-center bg-purple-500">
+                <div class="md:w-2/3 w-full px-4 text-white flex flex-col">
+                    <div class="flex flex-col">
+                        <div>
+                            <div class="flex flex-row">
+                                <Icon icon="akar-icons:clock" class="text-gray-400" style="font-size:32px"/>
+                                <p class="text-gray-400 ml-2 text-lg font-semibold">Horário de funcionamento</p>
+                            </div>
+                            <div class="flex flex-row">
+                                <p class="text-gray-400 text-sm mt-2 ml-6">De Segunda a Sexta das 8h às 12h. E das 14h às 20h.</p>
+                            </div>
+                        </div>
+                        <div class="mt-4">
+                            <div class="flex flex-row">
+                                <Icon icon="bi:telephone" class="text-gray-400" style="font-size:32px"/>
+                                <p class="text-gray-400 ml-2 text-lg font-semibold">Telefone</p>
+                            </div>
+                            <div class="flex flex-row">
+                                <p class="text-gray-400 text-sm mt-2 ml-6">4002-8922</p>
+                            </div>
+                        </div>
+                        <div class="mt-4">
+                            <div class="flex flex-row">
+                                <Icon icon="bi:telephone" class="text-gray-400" style="font-size:32px"/>
+                                <p class="text-gray-400 ml-2 text-lg font-semibold">Localização</p>
+                            </div>
+                            <div class="flex flex-row">
+                                <p class="text-gray-400 text-sm mt-2 ml-6">Av. Thurusbingu Thurusbangu, 666, Mooca - SP</p>
+                            </div>
+                        </div>
+                    <div class="flex mt-24 mb-12 flex-row flex-wrap justify-between">
+                        <div class="">
+                            <Link :href="route('home')">
+                                <jet-application-mark class="block h-9 w-auto" />
+                            </Link>
+                        </div>
+                            <Link :href="route('sobre-nos')">
+                                <div class="hidden md:block cursor-pointer text-gray-400 hover:text-white uppercase">Sobre</div>
+                            </Link>
+                            <a :href="route('terms.show')" class="hidden md:block cursor-pointer text-gray-400 hover:text-white uppercase">Termos de Uso</a>
+                            <a :href="route('policy.show')" class="hidden md:block cursor-pointer text-gray-400 hover:text-white uppercase">Políticas de Privacidade</a>
+                    </div>
+                    <hr class="border-gray-400"/>
+                    <p class="w-full text-center my-12 text-gray-400">Copyright © 2021 Herói Solidário</p>
+                </div>
+            </div>
+        </div>
         </div>
     </div>
 </template>

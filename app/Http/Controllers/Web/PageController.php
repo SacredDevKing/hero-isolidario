@@ -8,6 +8,7 @@ use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Route;
 use Inertia\Inertia;
 use App\Http\Controllers\Web\PageController;
+use App\Models\Donation;
 
 class PageController extends Controller
 {
@@ -27,15 +28,10 @@ class PageController extends Controller
         return Inertia::render('ProjetosCaridade');
     }
     public function doacoes(){
-        return Inertia::render('Doacoes');
-    }
-    public function minhas_doacoes(){
-        return Inertia::render('MinhasDoacoes');
+        $doacoes = Donation::get();
+        return view('doacoes', compact("doacoes"));
     }
     public function sobre_nos(){
         return Inertia::render('SobreNos');
-    }
-    public function quero_doar(){
-        return Inertia::render('QueroDoar');
     }
 }

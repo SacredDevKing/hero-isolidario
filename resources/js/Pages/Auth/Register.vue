@@ -67,11 +67,14 @@
                 <div class="mt-4">
                     <jet-label for="genero" value="Gênero" />
                     <select id="genero" class="mt-1 block w-full border-gray-300 focus:border-red-300 focus:ring focus:ring-red-200 focus:ring-opacity-50 rounded-md shadow-sm" v-model="form.genero" required>
-                            <option value="masculino">
+                            <option value="Masculino">
                                 Masculino
                             </option>
-                            <option value="feminino">
+                            <option value="Feminino">
                                 Feminino
+                            </option>
+                            <option value="Outro">
+                                Outro
                             </option>
                     </select>
                 </div>
@@ -288,11 +291,6 @@
 
             celMask(){
                 this.form.celular = this.form.celular.replace(/[^0-9]/g, '').replace(/^(\d{2})(\d{5})(\d{4})/g, '($1) $2-$3')
-            },
-
-            resetMask(){
-                this.form.cep = this.form.cep.replace(/[^0-9]/g, '');
-                this.form.celular = this.form.celular.replace(/[^0-9]/g, '');
             }
         },
     }

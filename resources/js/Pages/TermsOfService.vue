@@ -1,5 +1,5 @@
 <template>
-    <Head title="Terms of Service" />
+    <Head title="Termos de Uso" />
 
     <div class="font-sans text-gray-900 antialiased">
         <div class="pt-4 bg-gray-100">
@@ -9,6 +9,7 @@
                 </div>
 
                 <div v-html="terms" class="w-full sm:max-w-2xl mt-6 p-6 bg-white shadow-md overflow-hidden sm:rounded-lg prose">
+                    
                 </div>
             </div>
         </div>

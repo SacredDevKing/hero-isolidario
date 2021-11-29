@@ -4,6 +4,7 @@ use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Route;
 use Inertia\Inertia;
 use App\Http\Controllers\Web\PageController;
+use App\Http\Controllers\Web\DonationController;
 
 /*
 |--------------------------------------------------------------------------
@@ -17,3 +18,5 @@ use App\Http\Controllers\Web\PageController;
 */
 
 Route::get('/', [PageController::class, 'welcome'])->name('welcome');
+
+Route::resource('donations', DonationController::class)->middleware(['auth:sanctum', 'verified']);
